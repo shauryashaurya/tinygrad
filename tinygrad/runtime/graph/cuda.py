@@ -1,8 +1,8 @@
 import ctypes, collections
 from typing import Any, Optional, Tuple, Dict, List, cast
 import tinygrad.runtime.autogen.cuda as cuda
-from tinygrad.helpers import init_c_var, GraphException, getenv
-from tinygrad.device import CompiledRunner, update_stats, Buffer, MultiDeviceJITGraph, BufferXfer, Device, BufferOptions
+from tinygrad.helpers import init_c_var, GraphException, getenv, colored
+from tinygrad.device import CompiledRunner, Buffer, MultiDeviceJITGraph, BufferXfer, Device, BufferOptions
 from tinygrad.runtime.ops_cuda import CUDADevice, check, encode_args, cu_time_execution
 from tinygrad.shape.symbolic import Variable
 from tinygrad.engine.realize import ExecItem
@@ -15,7 +15,6 @@ class CUDAGraph(MultiDeviceJITGraph):
 
     self.jit_cache = jit_cache
     self.input_replace = get_input_replace(jit_cache, input_rawbuffers)
-    self.op_estimate, self.mem_estimate = get_jit_stats(jit_cache)
     self.jc_idxs_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(jit_cache)
     self.jc_idxs_with_updatable_var_vals = get_jc_idxs_with_updatable_var_vals(jit_cache)
     self.jc_idxs_with_updatable_rawbufs = list(set([x[0] for x in self.input_replace.keys()]))
@@ -31,17 +30,17 @@ class CUDAGraph(MultiDeviceJITGraph):
         global_size, local_size = ji.prg.launch_dims(var_vals)
 
         new_node = cuda.CUgraphNode()
-        deps = self.access_resources(ji.rawbufs[(outs:=ji.prg.outcount):], ji.rawbufs[:outs], new_dependency=new_node)
+        deps = self.access_resources(ji.bufs[(outs:=ji.prg.outcount):], ji.bufs[:outs], new_dependency=new_node)
         c_deps = (cuda.CUgraphNode*len(deps))(*deps) if deps else None
 
-        c_args, vargs = encode_args([cast(Buffer, x)._buf for x in ji.rawbufs], [var_vals[x] for x in ji.prg.vars])
+        c_args, vargs = encode_args([cast(Buffer, x)._buf for x in ji.bufs], [var_vals[x] for x in ji.prg.vars])
         kern_params = cuda.CUDA_KERNEL_NODE_PARAMS(ji.prg.clprg.prg, *global_size, *local_size, 0, None, vargs)
         check(cuda.cuGraphAddKernelNode(ctypes.byref(new_node), self.graph, c_deps, len(deps), ctypes.byref(kern_params)))
 
         if j in self.jc_idxs_with_updatable_launch_dims or j in self.jc_idxs_with_updatable_var_vals or j in self.jc_idxs_with_updatable_rawbufs:
           self.updatable_nodes[j] = (new_node, kern_params, c_args, False)
       elif isinstance(ji.prg, BufferXfer):
-        dest, src = [cast(Buffer, x) for x in ji.rawbufs[0:2]]
+        dest, src = [cast(Buffer, x) for x in ji.bufs[0:2]]
         src_dev, dest_dev = cast(CUDADevice, Device[src.device]), cast(CUDADevice, Device[dest.device])
         node_from = cuda.CUgraphNode()
         deps = self.access_resources(read=[src], write=[dest], new_dependency=node_from)
@@ -69,9 +68,10 @@ class CUDAGraph(MultiDeviceJITGraph):
     self.instance = init_c_var(cuda.CUgraphExec(), lambda x: check(cuda.cuGraphInstantiate_v2(ctypes.byref(x), self.graph, None, None, 0)))
 
     # clear jit inputs to allow their memory to be freed/reused
-    for (j,i) in self.input_replace.keys(): self.jit_cache[j].rawbufs[i] = None
+    for (j,i) in self.input_replace.keys(): self.jit_cache[j].bufs[i] = None
+    super().__init__(colored(f"<batched {len(self.jit_cache)}>", "cyan"), "CUDA", *get_jit_stats(jit_cache))
 
-  def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False, jit=False) -> Optional[float]:
+  def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False) -> Optional[float]:
     # Update rawbuffers in the c_args struct.
     for (j,i),input_idx in self.input_replace.items():
       if not self.updatable_nodes[j][3]: setattr(self.updatable_nodes[j][2], f'f{i}', input_rawbuffers[input_idx]._buf)
@@ -93,10 +93,7 @@ class CUDAGraph(MultiDeviceJITGraph):
       if not is_copy: check(cuda.cuGraphExecKernelNodeSetParams(self.instance, node, ctypes.byref(c_node_params)))
       else: check(cuda.cuGraphExecMemcpyNodeSetParams(self.instance, node, ctypes.byref(c_node_params), c_args))
 
-    et = cu_time_execution(lambda: check(cuda.cuGraphLaunch(self.instance, None)), enable=wait)
-    update_stats(f"<batched {len(self.jit_cache)}>", self.op_estimate, self.mem_estimate, var_vals, et, buf_count=len(input_rawbuffers),
-                 jit=jit, num_kernels=len(self.jit_cache), device="CUDA")
-    return et
+    return cu_time_execution(lambda: check(cuda.cuGraphLaunch(self.instance, None)), enable=wait)
 
   def __del__(self):
     if hasattr(self, 'graph'): check(cuda.cuGraphDestroy(self.graph))

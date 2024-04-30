@@ -1,20 +1,19 @@
 from typing import List, Any, Dict, cast, Optional
 import Metal
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import dedup, unwrap2, GraphException
-from tinygrad.device import Buffer, CompiledRunner, update_stats
+from tinygrad.helpers import dedup, unwrap2, GraphException, colored
+from tinygrad.device import Buffer, CompiledRunner, Runner
 from tinygrad.engine.realize import ExecItem
 from tinygrad.engine.jit import get_input_replace, get_jit_stats, get_jc_idxs_with_updatable_launch_dims
 from tinygrad.shape.symbolic import Variable
 from tinygrad.runtime.ops_metal import MetalDevice, wait_check
 
-class MetalGraph:
+class MetalGraph(Runner):
   def __init__(self, device:MetalDevice, jit_cache: List[ExecItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
     if not all(isinstance(ji.prg, CompiledRunner) for ji in jit_cache): raise GraphException
 
     self.jit_cache = jit_cache
     self.input_replace = get_input_replace(jit_cache, input_rawbuffers)
-    self.op_estimate, self.mem_estimate = get_jit_stats(jit_cache)
     self.jc_idx_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(jit_cache)
     self.device: MetalDevice = device
 
@@ -37,13 +36,13 @@ class MetalGraph:
       pipeline_state = unwrap2(self.device.device.newComputePipelineStateWithDescriptor_options_reflection_error_(descriptor, Metal.MTLPipelineOption(0), None, None))  # noqa: E501
       icb_command = self.icb.indirectComputeCommandAtIndex_(j)
       icb_command.setComputePipelineState_(pipeline_state)
-      for i,b in enumerate(ji.rawbufs):
+      for i,b in enumerate(ji.bufs):
         if b is not None:
           icb_command.setKernelBuffer_offset_atIndex_(b._buf, 0, i)
           all_resources.append(b._buf)
       var_vals_keys = list(var_vals.keys())
       for i,v in enumerate(prg.vars):
-        icb_command.setKernelBuffer_offset_atIndex_(self.int_buf, var_vals_keys.index(v)*4, len(ji.rawbufs)+i)
+        icb_command.setKernelBuffer_offset_atIndex_(self.int_buf, var_vals_keys.index(v)*4, len(ji.bufs)+i)
       if j not in self.jc_idx_with_updatable_launch_dims:
         global_size, local_size = prg.launch_dims(var_vals)
         icb_command.concurrentDispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSize(*global_size), Metal.MTLSize(*local_size))
@@ -53,9 +52,10 @@ class MetalGraph:
     if len(var_vals): self.int_buf_view = self.int_buf.contents().as_buffer(self.int_buf.length()).cast('i')
 
     # clear jit inputs to allow their memory to be freed/reused
-    for (j,i) in self.input_replace.keys(): self.jit_cache[j].rawbufs[i] = None
+    for (j,i) in self.input_replace.keys(): self.jit_cache[j].bufs[i] = None
+    super().__init__(colored(f"<batched {len(self.jit_cache)}>", "cyan"), device.dname, *get_jit_stats(jit_cache))
 
-  def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False, jit=False) -> Optional[float]:
+  def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False) -> Optional[float]:
     # NOTE: you at least can't update the ints if this is running
     if self.command_buffer is not None and self.command_buffer in self.device.mtl_buffers_in_flight: wait_check(self.command_buffer)
     all_resources = self.all_resources + [x._buf for x in input_rawbuffers]
@@ -74,9 +74,6 @@ class MetalGraph:
     self.command_buffer = command_buffer
     if wait:
       wait_check(command_buffer)
-      et = command_buffer.GPUEndTime() - command_buffer.GPUStartTime()
-    else:
-      self.device.mtl_buffers_in_flight.append(command_buffer)
-      et = None
-    update_stats(f"<batched {len(self.jit_cache)}>", self.op_estimate, self.mem_estimate, var_vals, et, buf_count=len(input_rawbuffers), jit=jit, num_kernels=len(self.jit_cache))  # noqa: E501
-    return et
+      return command_buffer.GPUEndTime() - command_buffer.GPUStartTime()
+    self.device.mtl_buffers_in_flight.append(command_buffer)
+    return None

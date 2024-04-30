@@ -3,24 +3,26 @@
 # NOTE: this has overlap with external_test_opt.py
 
 import unittest
-from typing import List, Optional
+from typing import List, Optional, Union
 from tinygrad.tensor import Tensor
-from tinygrad.ops import LoadOps
-from tinygrad.helpers import DEBUG, GRAPH
+from tinygrad.ops import LoadOps, ReduceOps
+from tinygrad.helpers import DEBUG, GRAPH, flatten
 from tinygrad.codegen.linearizer import Linearizer
 from tinygrad.features.graph import print_tree, realized_lazybuffer
 from tinygrad.engine.schedule import create_schedule
 from tinygrad import nn, dtypes
+from test.helpers import is_dtype_supported
 
-def check_schedule(t:Tensor, allowed:int, to_prerealize:Optional[List[Tensor]]=None, filter_loadops=True):
+def check_schedule(t:Union[Tensor, List[Tensor]], allowed:int, to_prerealize:Optional[List[Tensor]]=None, filter_loadops=True):
+  if isinstance(t, Tensor): t = [t]
   seen = set()
   if to_prerealize:
     for pre in to_prerealize:
-      for s in create_schedule([pre.lazydata], seen.copy()):
+      for s in pre.schedule(seen=seen.copy()):
         for i,out in enumerate(s.outputs):
           if GRAPH: realized_lazybuffer(out, 0)
           seen.add(out)
-  sched = create_schedule([t.lazydata], seen)
+  sched = create_schedule(flatten([r.lazydata.lbs for r in t]), seen)
   if GRAPH:
     for i,s in enumerate(sched):
       for out in s.outputs: realized_lazybuffer(out, i+1)
@@ -37,6 +39,7 @@ def check_schedule(t:Tensor, allowed:int, to_prerealize:Optional[List[Tensor]]=N
     l = Linearizer(*s.ast)
     l.hand_coded_optimizations()
     l.linearize()
+  return sched
 
 class TestSchedule(unittest.TestCase):
   def test_basic_binop_fusion(self):
@@ -153,6 +156,26 @@ class TestSchedule(unittest.TestCase):
     c = a.sum()
     bc = b+c
     check_schedule(bc, 1)
+
+  def test_cache_reduce_parent(self):
+    x = Tensor.empty(32)
+    r0 = x.mean(axis=0, keepdim=True)
+    r1 = (x - r0).sum(axis=0).div(2)
+    out = r0 + r1
+    schedule = check_schedule(out, 2)
+    reduceops = [x for si in schedule for out in si.ast for x in out.lazyops if x.op in ReduceOps]
+    assert len(reduceops) == 2
+
+  def test_cache_reduce_multiple_children(self):
+    x = Tensor.empty(32)
+    y = Tensor.empty(4, 4)
+    r0 = x.mean(axis=0, keepdim=True)
+    r1 = (x - r0).sum(axis=0).div(2)
+    out0 = r0 + y
+    out1 = r1 + y
+    schedule = check_schedule([out0, out1], 4)
+    reduceops = [x for si in schedule for out in si.ast for x in out.lazyops if x.op in ReduceOps]
+    assert len(reduceops) == 2
 
   def test_fold_double_unary(self):
     y = Tensor.empty(2)
@@ -429,6 +452,146 @@ class TestSchedule(unittest.TestCase):
     y = Tensor(2) + Tensor(2)
     out = x.contiguous() + y.contiguous()
     check_schedule(out, 2)
+
+  def test_reduce_same_size(self):
+    a = Tensor.empty(4, 4)
+    out0 = a.sum() + 2
+    out1 = a.sum() + 4
+    out2 = out0 * out1
+    check_schedule([out0, out1, out2], 2)
+
+  def test_reduce_multiple_paths(self):
+    a = Tensor.empty(4, 4)
+    out0 = a.sum().exp2()
+    # out1 has two paths to a.sum()
+    out1 = a.sum() + out0
+    check_schedule([out0, out1], 1)
+
+  def test_reduce_ext_reduce_child(self):
+    a = Tensor.empty((4, 4))
+    b = Tensor.empty((4, 4))
+    # b.sum() is not a descendant of the fused nodes
+    out0 = a.sum() + b.sum() + 2
+    out1 = a.sum() + b.sum() + 4
+    check_schedule([out0, out1], 4)
+
+  def test_reduce_multiple_paths_midreduce(self):
+    a = Tensor.empty(4, 4)
+    r = a.sum()
+    out0 = r.exp2()
+    # reduce node in the indirect path from r to out2
+    out1 = (a - out0).max()
+    out2 = r + out1
+    check_schedule([r, out0, out1, out2], 4)
+
+  def test_reduce_multiple_paths_midreduce_fused(self):
+    a = Tensor.empty(4, 4)
+    b = Tensor.empty(4, 4)
+    out0 = a.sum() + 4
+    out1 = b.max() + out0*2
+    out2 = a.sum() + out1
+    check_schedule([out0, out1, out2], 4)
+
+  def test_reduce_multiple_paths_midexpand(self):
+    a = Tensor.empty(4, 4)
+    b = Tensor.empty(4, 4, 4)
+    r = a.sum()
+    out0 = r.exp2()
+    # e1 is in the indirect path from a.sum() to out1
+    e = b + out0
+    out1 = r + e[0][0][0]
+    check_schedule([r, out0, out1, e], 4)
+
+  def test_reduce_expand_child(self):
+    a = Tensor.empty((32, 32, 32))
+    b = Tensor.empty((1, 16))
+    out0 = a.sum() + 2
+    out1 = a.sum() + b
+    check_schedule([out0, out1], 4)
+
+  def test_reduce_shrink_child(self):
+    a = Tensor.empty(100, 100)
+    b = Tensor.empty(10,)
+    c = a.sum() + b[0]
+    d = a.sum() + 2
+    check_schedule([c, d], 1)
+
+  def test_reduce_multiple_paths_midshrink(self):
+    a = Tensor.empty(4, 4)
+    r = a.sum(axis=1)
+    out0 = r.exp2()
+    out1 = out0[0] + out0
+    check_schedule([r, out0, out1], 3)
+
+  def test_reduce_shrink_output(self):
+    a = Tensor.empty(4, 4)
+    r = a.sum(keepdim=True)
+    out0 = r.exp2()
+    out1 = out0[0] + Tensor.empty(1, )
+    check_schedule([r, out0, out1], 3)
+
+  def test_softmax_fusion(self):
+    out = Tensor.empty(4, 12, 64, 64).softmax()
+    check_schedule(out, 3)
+
+  def test_layernorm_onelayer_fusion(self):
+    layer = nn.LayerNorm([10, 10])
+    x = Tensor.empty(20, 5, 10, 10)
+    check_schedule(layer(x), 3)
+
+  def test_scaled_dot_product_attention_fusion(self):
+    x, y, z, m = (Tensor.empty(32, 8, 16, 16) for _ in range(4))
+    out = Tensor.scaled_dot_product_attention(x, y, z, attn_mask=m)
+    check_schedule(out, 5)
+
+  def test_scaled_dot_product_attention_causal_fusion(self):
+    x, y, z, m = (Tensor.empty(32, 8, 16, 16) for _ in range(4))
+    out = Tensor.scaled_dot_product_attention(x, y, z, attn_mask=m, is_causal=True)
+    check_schedule(out, 7)
+
+  def test_adam_step_fusion(self):
+    x = Tensor.empty(4, 64, 768)
+    layer = nn.Linear(768, 768*4)
+    opt = nn.optim.Adam(nn.state.get_parameters(layer), lr=1e-4)
+    layer(x).relu().sum().backward()
+    check_schedule(opt.schedule_step(), 14)
+
+  @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
+  def test_prefer_half_buffer(self):
+    x = Tensor.ones(4).contiguous().realize()
+    # y = Tensor.ones(4).contiguous().realize()
+    z = Tensor.ones(4, 4).contiguous().realize()
+
+    # should not create extra kernel if output will be realized anyways
+    dummy = x.sum().half().float()
+    check_schedule(dummy, 1)
+    dummy = x.sum().half().float().contiguous() + 1
+    check_schedule(dummy, 2)
+
+    # shared between two outputs
+    shared = x.sum().half().float()
+    a = shared * 2
+    b = shared * 3
+    sched = check_schedule([a, b], 1)
+    for si in sched[:-2]: assert all(out.dtype is dtypes.half for out in si.outputs)
+
+    # reduce
+    a = z.sum(axis=0).half().float().sum(axis=0)
+    sched = check_schedule(a, 2)
+    for si in sched[:-1]: assert all(out.dtype is dtypes.half for out in si.outputs)
+
+    # expand
+    # expand will realize just after the .float(), so requires change to realize-before-expand
+    # normal = (x.sum().half().float().reshape(1) * y).sum()
+    # sched = check_schedule(normal, 2)
+    # for si in sched[:-1]: assert all(out.dtype == dtypes.half for out in si.outputs[:-1])
+
+    # parallel reduce
+    # a = x.sum().half().float() * y.sum().half().float()
+    # b = a + 1
+    # c = a + 2
+    # sched = check_schedule([b, c], 4)
+    # doesn't store either in half because it doesn't chase
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)

@@ -1,8 +1,8 @@
 import ctypes, collections, time, itertools
 from typing import List, Any, Dict, cast, Optional, Union, Tuple
-from tinygrad.helpers import GraphException, init_c_var, round_up
+from tinygrad.helpers import GraphException, init_c_var, round_up, colored
 from tinygrad.buffer import Buffer, BufferOptions
-from tinygrad.device import Compiled, CompiledRunner, BufferXfer, MultiDeviceJITGraph, update_stats, Device
+from tinygrad.device import Compiled, CompiledRunner, BufferXfer, MultiDeviceJITGraph, Device
 from tinygrad.shape.symbolic import Variable
 from tinygrad.runtime.ops_hsa import HSADevice, PROFILE, Profiler
 from tinygrad.engine.realize import ExecItem
@@ -29,7 +29,6 @@ class HSAGraph(MultiDeviceJITGraph):
   def __init__(self, jit_cache: List[ExecItem], input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int]):
     self.jit_cache = jit_cache
     self.input_replace = get_input_replace(jit_cache, input_rawbuffers)
-    self.op_estimate, self.mem_estimate = get_jit_stats(jit_cache) #type:ignore
     self.jc_idxs_with_updatable_launch_dims = get_jc_idxs_with_updatable_launch_dims(jit_cache)
     self.jc_idxs_with_updatable_var_vals = get_jc_idxs_with_updatable_var_vals(jit_cache)
 
@@ -38,7 +37,7 @@ class HSAGraph(MultiDeviceJITGraph):
     for ji in self.jit_cache:
       if isinstance(ji.prg, CompiledRunner): compiled_devices.add(ji.prg.device)
       elif isinstance(ji.prg, BufferXfer):
-        for x in ji.rawbufs[0:2]: compiled_devices.add(Device[cast(Buffer, x).device])
+        for x in ji.bufs[0:2]: compiled_devices.add(Device[cast(Buffer, x).device])
       else: raise GraphException
     if any(not isinstance(d, HSADevice) for d in compiled_devices): raise GraphException
 
@@ -56,7 +55,7 @@ class HSAGraph(MultiDeviceJITGraph):
       if not isinstance(ji.prg, CompiledRunner): continue
       self.ji_kargs_structs[j] = ji.prg.clprg.args_struct_t.from_address(kernargs_ptrs[ji.prg.device])
       kernargs_ptrs[ji.prg.device] += round_up(ctypes.sizeof(ji.prg.clprg.args_struct_t), 16)
-      for i in range(len(ji.rawbufs)): self.ji_kargs_structs[j].__setattr__(f'f{i}', cast(Buffer, ji.rawbufs[i])._buf)
+      for i in range(len(ji.bufs)): self.ji_kargs_structs[j].__setattr__(f'f{i}', cast(Buffer, ji.bufs[i])._buf)
       for i in range(len(ji.prg.vars)): self.ji_kargs_structs[j].__setattr__(f'v{i}', var_vals[ji.prg.vars[i]])
 
     # Build queues.
@@ -76,7 +75,7 @@ class HSAGraph(MultiDeviceJITGraph):
 
     for j,ji in enumerate(self.jit_cache):
       if isinstance(ji.prg, CompiledRunner):
-        wait_signals = self.access_resources(ji.rawbufs[(outs:=ji.prg.outcount):], ji.rawbufs[:outs], new_dependency=j, sync_with_aql_packets=False)
+        wait_signals = self.access_resources(ji.bufs[(outs:=ji.prg.outcount):], ji.bufs[:outs], new_dependency=j, sync_with_aql_packets=False)
         for i in range(0, len(wait_signals), 5):
           self.virt_aql_queues[ji.prg.device].submit_barrier(wait_signals[i:i+5])
         self.packets[j] = hsa.hsa_kernel_dispatch_packet_t.from_address(self.virt_aql_queues[ji.prg.device].write_addr)
@@ -86,7 +85,7 @@ class HSAGraph(MultiDeviceJITGraph):
                                                           ctypes.addressof(self.ji_kargs_structs[j]), completion_signal=sync_signal)
         if PROFILE: self.profile_info[ji.prg.device].append((sync_signal, ji.prg.clprg.name, False))
       elif isinstance(ji.prg, BufferXfer):
-        dest, src = [cast(Buffer, x) for x in ji.rawbufs[0:2]]
+        dest, src = [cast(Buffer, x) for x in ji.bufs[0:2]]
         dest_dev, src_dev = cast(HSADevice, Device[dest.device]), cast(HSADevice, Device[src.device])
         sync_signal = self.alloc_signal(reset_on_start=True, wait_on=[dest_dev, src_dev])
 
@@ -113,9 +112,10 @@ class HSAGraph(MultiDeviceJITGraph):
     hsa.hsa_signal_silent_store_relaxed(self.finish_signal, 0)
 
     # clear jit inputs to allow their memory to be freed/reused
-    for (j,i) in self.input_replace.keys(): self.jit_cache[j].rawbufs[i] = None
+    for (j,i) in self.input_replace.keys(): self.jit_cache[j].bufs[i] = None
+    super().__init__(colored(f"<batched {len(self.jit_cache)}>", "cyan"), "HSA", *get_jit_stats(jit_cache))
 
-  def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False, jit=False) -> Optional[float]:
+  def __call__(self, input_rawbuffers: List[Buffer], var_vals: Dict[Variable, int], wait=False) -> Optional[float]:
     # Wait and restore signals
     hsa.hsa_signal_wait_scacquire(self.finish_signal, hsa.HSA_SIGNAL_CONDITION_LT, 1, (1 << 64) - 1, hsa.HSA_WAIT_STATE_ACTIVE)
     for sig in self.signals_to_reset: hsa.hsa_signal_silent_store_relaxed(sig, 1)
@@ -158,8 +158,6 @@ class HSAGraph(MultiDeviceJITGraph):
       et = time.perf_counter() - st
 
     for profdev,profdata in self.profile_info.items(): Profiler.tracked_signals[profdev] += profdata
-    update_stats(f"<batched {len(self.jit_cache)}>", self.op_estimate, self.mem_estimate, var_vals, et, buf_count=len(input_rawbuffers),
-                 jit=jit, num_kernels=len(self.jit_cache), device="HSA")
     return et
 
   def alloc_signal(self, reset_on_start=False, wait_on=None):

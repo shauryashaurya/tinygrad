@@ -15,6 +15,50 @@ from tinygrad.helpers import prod, Context, getenv
 from tinygrad.dtype import DType, dtypes
 from tinygrad.codegen.uops import UOpGraph
 
+def helper_realized_ast(r:Tensor):
+  s = create_schedule([r.lazydata])
+  run_schedule(s[:-1])  # run all kernels except the last one
+  # now all input LazyBuffers buffers in s[-1] should be realized
+  # allocate an output buffer
+  output_buffer = Buffer((out:=s[-1].outputs[0]).device, out.size, out.dtype).allocate()
+  return s[-1].ast[0], [output_buffer] + list(s[-1].inputs)
+
+def helper_tc_allclose(m:int, k:int, n:int, dtype_in:DType, dtype_out:DType, axis:int=0, tc_opt:int=0):
+  a, b = Tensor.rand(m, k, dtype=dtype_in), Tensor.rand(k, n, dtype=dtype_in)
+  np_a, np_b = a.numpy(), b.numpy()
+  r = a.matmul(b, acc_dtype=dtype_out)
+  sched = create_schedule([r.lazydata])
+  realized_ast = sched[-1].ast[0]
+  run_schedule(sched)
+  out = r.numpy()
+  k = Linearizer(realized_ast)
+  k.apply_tensor_cores(1, axis=axis, tc_opt=tc_opt)
+  k.linearize()
+  assert len([uop for uop in k.uops if uop.uop is UOps.WMMA]) > 0, "tensor core not triggered"
+  assert len([x for x in k.applied_opts if x.op is OptOps.TC]) == 1, "tensor core opt not included"
+  np_c = np_a @ np_b
+  if dtype_out == dtypes.half: tc_atol, tc_rtol = 1e-2, 1e-3
+  elif dtype_in == dtypes.bfloat16: tc_atol, tc_rtol = 1e-2, 3e-3
+  else: tc_atol, tc_rtol = 5e-3, 1e-4
+  np.testing.assert_allclose(np_c, out, atol=tc_atol, rtol=tc_rtol)
+
+def helper_tc_ensure_uops_and_opts_count(m:int, k:int, n:int, dtype_in:DType, dtype_out:DType, axis:int=0, tc_opt:int=0, ensure_triggered:bool=True):
+  a, b = Tensor.rand(m, k, dtype=dtype_in), Tensor.rand(k, n, dtype=dtype_in)
+  r = a.matmul(b, acc_dtype=dtype_out)
+  sched = create_schedule([r.lazydata])
+  realized_ast = sched[-1].ast[0]
+  k = Linearizer(realized_ast)
+  k.apply_tensor_cores(1, axis=axis, tc_opt=tc_opt)
+  k.linearize()
+  wmmas = len([uop for uop in k.uops if uop.uop is UOps.WMMA])
+  tcs = len([x for x in k.applied_opts if x.op is OptOps.TC])
+  if ensure_triggered:
+    assert wmmas > 0, "tensor core not triggered"
+    assert tcs == 1, "tensor core opt not included"
+  else:
+    assert wmmas == 0, "tensor core is incorrectly triggered"
+    assert tcs == 0, "tensor core opt is incorrectly included"
+
 class TestLinearizer(unittest.TestCase):
   def test_arg_dedup(self):
     a, b = Tensor.randn(4), Tensor.randn(4)
@@ -22,7 +66,7 @@ class TestLinearizer(unittest.TestCase):
     c = ((a.shrink(((0, 2),)) - a.shrink(((2, 4),))) - (b.shrink(((0, 2),)) - b.shrink(((2, 4),))))
     lowered = list(lower_schedule(create_schedule([c.lazydata])))
     for ei in lowered: ei.run()
-    rawbufs = lowered[-1].rawbufs
+    rawbufs = lowered[-1].bufs
     assert len(rawbufs) == 3 and set(rawbufs[1:]) == {a.lazydata.base.realized, b.lazydata.base.realized}
     np_c = (np_a[:2] - np_a[2:]) - (np_b[:2] - np_b[2:])
     np.testing.assert_allclose(np_c, c.numpy(), atol=1e-4, rtol=1e-4)
@@ -178,21 +222,60 @@ class TestLinearizer(unittest.TestCase):
       self.skipTest("device doesn't have tensor cores")
     for tc in tensor_cores[Device[Device.DEFAULT].compiler.compiler_opts.device]:
       if getenv("EMULATE_CUDA") and (tc.dtype_in == dtypes.bfloat16 or tc.dtype_out == dtypes.bfloat16): continue
-      a, b = Tensor.rand(tc.dims[1], tc.dims[2], dtype=tc.dtype_in), Tensor.rand(tc.dims[2], tc.dims[0], dtype=tc.dtype_in)
-      np_a, np_b = a.numpy(), b.numpy()
-      r = a.matmul(b, acc_dtype=tc.dtype_out)
-      sched = create_schedule([r.lazydata])
-      realized_ast = sched[-1].ast[0]
-      run_schedule(sched)
-      out = r.numpy()
-      k = Linearizer(realized_ast)
-      k.apply_tensor_cores(1)
-      k.linearize()
-      assert len([uop for uop in k.uops if uop.uop is UOps.WMMA]) == 1, "tensor core not triggered"
-      assert len([x for x in k.applied_opts if x.op is OptOps.TC]) == 1, "tensor core opt not included"
-      np_c = np_a @ np_b
-      (tc_atol, tc_rtol) = (1e-2, 1e-3) if tc.dtype_out == dtypes.half else (5e-3, 1e-4)
-      np.testing.assert_allclose(np_c, out, atol=tc_atol, rtol=tc_rtol)
+      helper_tc_allclose(tc.dims[1], tc.dims[2], tc.dims[0], tc.dtype_in, tc.dtype_out, axis=0, tc_opt=0)
+
+  def test_tensor_cores_padded(self):
+    if not Device[Device.DEFAULT].compiler.compiler_opts.has_tensor_cores:
+      self.skipTest("device doesn't have tensor cores")
+    for tc in tensor_cores[Device[Device.DEFAULT].compiler.compiler_opts.device]:
+      if getenv("EMULATE_CUDA") and (tc.dtype_in == dtypes.bfloat16 or tc.dtype_out == dtypes.bfloat16): continue
+      pad = 1
+
+      # check that TC is triggered for TC_OPT=2
+      helper_tc_ensure_uops_and_opts_count(tc.dims[0]+pad, tc.dims[2]+pad, tc.dims[1]+pad,
+                                           tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=True)
+
+      # check that TC is not triggered for TC_OPT<2
+      helper_tc_ensure_uops_and_opts_count(tc.dims[0]+pad, tc.dims[2]+pad, tc.dims[1]+pad,
+                                           tc.dtype_in, tc.dtype_out, tc_opt=1, ensure_triggered=False)
+      helper_tc_ensure_uops_and_opts_count(tc.dims[0]+pad, tc.dims[2]+pad, tc.dims[1]+pad,
+                                           tc.dtype_in, tc.dtype_out, tc_opt=0, ensure_triggered=False)
+
+      # check excessive padding doesn't trigger padded TC in TC_OPT=2
+      helper_tc_ensure_uops_and_opts_count(tc.dims[0]//2, tc.dims[2], tc.dims[1], tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=False)
+      helper_tc_ensure_uops_and_opts_count(tc.dims[0], tc.dims[2]//2, tc.dims[1], tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=False)
+      helper_tc_ensure_uops_and_opts_count(tc.dims[0], tc.dims[2], tc.dims[1]//2, tc.dtype_in, tc.dtype_out, tc_opt=2, ensure_triggered=False)
+
+      # check correctness
+      helper_tc_allclose(tc.dims[1]+pad, tc.dims[2]+pad, tc.dims[0]+pad, tc.dtype_in, tc.dtype_out, tc_opt=2)
+
+  @unittest.skipIf(Device.DEFAULT == "RHIP", "RHIP is really slow here")
+  def test_tensor_cores_multi_reduce(self):
+    if not Device[Device.DEFAULT].compiler.compiler_opts.has_tensor_cores:
+      self.skipTest("device doesn't have tensor cores")
+    for tc in tensor_cores[Device[Device.DEFAULT].compiler.compiler_opts.device]:
+      if getenv("EMULATE_CUDA") and (tc.dtype_in == dtypes.bfloat16 or tc.dtype_out == dtypes.bfloat16): continue
+      # this will be a M=G16, N=G32, M=G16, M=G16, K=R16, K=R16, K=R16 with 9 choices of TC MNK axes
+      golden_result = None
+      for axis in range(9):
+        a = Tensor.rand(16, 16, 29, 29, dtype=tc.dtype_in).realize()
+        b = Tensor.rand(32, 16, 16, 16, dtype=tc.dtype_in).realize()
+        c = a.conv2d(b, padding=1, acc_dtype=tc.dtype_out)
+        realized_ast, real_bufs = helper_realized_ast(c)
+
+        k = Linearizer(realized_ast)
+        k.apply_tensor_cores(1, axis=axis, tc_opt=2)
+        k.linearize()
+        assert len([uop for uop in k.uops if uop.uop is UOps.WMMA]) > 0, "tensor core not triggered"
+        assert len([x for x in k.applied_opts if x.op is OptOps.TC]) == 1, "tensor core opt not included"
+
+        prg = Device[Device.DEFAULT].to_program(k)
+        real_bufs[0].copyin(np.zeros((real_bufs[0].size, ), dtype=real_bufs[0].dtype.np).data) # Zero to check that all values are filled
+        prg.exec(real_bufs)
+        result = np.frombuffer(real_bufs[0].as_buffer(), real_bufs[0].dtype.np)
+
+        if golden_result is None: golden_result = np.frombuffer(real_bufs[0].as_buffer(), real_bufs[0].dtype.np)
+        np.testing.assert_allclose(result, golden_result, atol=0.1, rtol=0.15)
 
   def test_limit_dims_to_max_5d_global(self):
     t = Tensor.empty(3, 4, 5, 6, 7).pad(((1, 1), (1, 1), (1, 1), (1, 1), (1, 1))) + 1
@@ -268,14 +351,6 @@ class TestLinearizer(unittest.TestCase):
     helper(Tensor.arange(-3.2, 6.7, 0.64))
     helper(Tensor.arange(256), max_ops=2)
     helper(Tensor.arange(255), max_ops=0)
-
-def helper_realized_ast(r:Tensor):
-  s = create_schedule([r.lazydata])
-  run_schedule(s[:-1])  # run all kernels except the last one
-  # now all input LazyBuffers buffers in s[-1] should be realized
-  # allocate an output buffer
-  output_buffer = Buffer((out:=s[-1].outputs[0]).device, out.size, out.dtype).allocate()
-  return s[-1].ast[0], [output_buffer] + list(s[-1].inputs)
 
 @unittest.skipUnless(Device[Device.DEFAULT].compiler.compiler_opts.supports_float4, "need backends that support float4")
 class TestFloat4(unittest.TestCase):
@@ -508,7 +583,7 @@ def helper_linearizer_opt(r:Tensor, opts=[], apply_tc=False, atol=1e-4, rtol=1e-
   def check_opt(opts, create_k, to_prg, expected_color_size):
     k = create_k()
     if apply_tc:
-      assert k.apply_tensor_cores(1, opts), "no tensor core triggered"
+      assert k.apply_tensor_cores(1, extra_opts=opts), "no tensor core triggered"
     else:
       for opt in opts:
         k.apply_opt(opt)
@@ -680,6 +755,8 @@ class TestKernelOpts(unittest.TestCase):
     N = 128
     Tensor.manual_seed(1552)
     for tc in tensor_cores[Device[Device.DEFAULT].compiler.compiler_opts.device]:
+      # bf16 buffer returns float32 numpy outputs so test would fail. testing opt with half suffices.
+      if tc.dtype_in == dtypes.bfloat16: continue
       a, b = Tensor.rand(N, N, dtype=tc.dtype_in), Tensor.rand(N, N, dtype=tc.dtype_in)
       r = a.matmul(b, acc_dtype=tc.dtype_out)
       (atol, rtol) = ((0.25, 0.01) if tc.dtype_out == dtypes.half else (3e-2, 1e-3)) if tc.dtype_in == dtypes.half else (1e-4, 1e-4)

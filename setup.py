@@ -36,6 +36,7 @@ setup(name='tinygrad',
             "ruff",
             "types-tqdm",
         ],
+        'mlperf': ["mlperf-logging @ git+https://github.com/mlperf/logging.git@4.0.0-rc2"],
         'testing': [
             "torch",
             "pillow",
@@ -52,6 +53,13 @@ setup(name='tinygrad',
             "librosa",
             "networkx",
             "hypothesis",
+            "nibabel",
+        ],
+        'docs': [
+            "mkdocs-material",
+            "mkdocstrings[python]",
+            "markdown-callouts",
+            "markdown-exec[ansi]"
         ],
         'testing_tf': [
             "tensorflow==2.15.1",

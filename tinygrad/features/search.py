@@ -11,13 +11,13 @@ from tinygrad.tensor import Tensor
 from tinygrad.shape.symbolic import sym_infer, Variable
 
 actions = [Opt(op=OptOps.UPCAST, axis=axis, amt=amt) for amt in [0,2,3,4,5,7] for axis in range(6)]
-actions += [Opt(op=OptOps.UNROLL, axis=axis, amt=amt) for amt in [0,4] for axis in range(4)]
+actions += [Opt(op=OptOps.UNROLL, axis=axis, amt=amt) for amt in [0,4,7] for axis in range(4)]
 actions += [Opt(op=OptOps.LOCAL, axis=axis, amt=amt) for amt in [2,3,4,8,13,16,29] for axis in range(5)]
-actions += [Opt(op=OptOps.GROUPTOP, axis=axis, amt=amt) for amt in [13,16,29,32,256] for axis in range(3)]
+actions += [Opt(op=OptOps.GROUPTOP, axis=axis, amt=amt) for amt in [13,16,28,29,32,49,64,256] for axis in range(3)]
 actions += [Opt(op=OptOps.GROUP, axis=axis, amt=amt) for amt in [0,4,8,16] for axis in range(3)]
 actions += [Opt(op=OptOps.PADTO, axis=axis, amt=amt) for amt in [32] for axis in range(7)]
 actions += [Opt(op=OptOps.LOCAL, axis=0, amt=32), Opt(op=OptOps.UPCASTMID, axis=1, amt=4), Opt(op=OptOps.TC, axis=0, amt=0)]
-actions += [Opt(op=OptOps.TC, axis=axis, amt=1) for axis in range(4)]
+actions += [Opt(op=OptOps.TC, axis=axis, amt=getenv("TC_OPT", 2)) for axis in range(9)] # covers resnet kernels (3 global * 3 reduce)
 if getenv("NOLOCALS"): actions += [Opt(op=OptOps.NOLOCALS)]
 
 def _get_test_global_size(global_size, max_global_size, var_vals):
@@ -41,13 +41,14 @@ def _time_program(variables:List[Variable], outcount:int, rdev:Compiled, lib:byt
   for _ in range(cnt):
     if clear_l2:
       with Context(DEBUG=0, BEAM=0, CACHECOLLECTING=0): Tensor.ones(1024,1024).contiguous().realize()
-    tms.append(cast(float, car(rawbufs, var_vals, wait=True, do_update_stats=False))*factor)
+    tms.append(cast(float, car(rawbufs, var_vals, wait=True))*factor)
     if early_stop is not None and early_stop < tms[-1]: break
   return tms
 
-def _compile_linearizer(compiler:Compiler, lin:Linearizer, name:Optional[str]=None) -> Tuple[bytes, Optional[List[int]], Optional[List[int]],
-                                                                                             List[Variable], int, float, int]:
+def _compile_linearizer(compiler:Compiler, lin:Linearizer, name:Optional[str]=None, enforce_max:bool=False) \
+  -> Tuple[bytes, Optional[List[int]], Optional[List[int]], List[Variable], int, float, int]:
   lin.linearize()
+  if enforce_max and len(lin.uops.uops) >= getenv("BEAM_UOPS_MAX", 3000) > 0: raise RuntimeError("too many uops")
   src = compiler.render(name if name is not None else to_function_name(lin.name), lin.uops)   # NOTE: these all have the same name for deduping
   if DEBUG >= 5: print(src)
   st = time.perf_counter()
@@ -56,7 +57,7 @@ def _compile_linearizer(compiler:Compiler, lin:Linearizer, name:Optional[str]=No
   return prog, lin.global_size, lin.local_size, lin.uops.vars(), len(lin.outbufs), et, len(lin.uops.uops)
 
 def _try_compile_linearized_w_idx(x:Tuple[int,Linearizer], compiler:Compiler):
-  try: return x[0], _compile_linearizer(compiler, x[1], "test")
+  try: return x[0], _compile_linearizer(compiler, x[1], "test", enforce_max=True)
   except Exception:
     if DEBUG >= 4: traceback.print_exc()
     return x[0], None
@@ -110,9 +111,11 @@ def beam_search(lin:Linearizer, rawbufs:List[Buffer], amt:int, allow_test_size=T
   beam: List[Tuple[Linearizer, float]] = []
   seen_libs = set()
 
-  default_parallel, min_progress_micros = 1 if lin.opts.device in {"CUDA", "HSA", "KFD"} else 0, getenv("BEAM_MIN_PROGRESS",0.01)
-  if beam_pool is None and getenv("PARALLEL", default_parallel):
-    beam_pool = multiprocessing.get_context("spawn").Pool(multiprocessing.cpu_count(), _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
+  default_parallel = multiprocessing.cpu_count() if lin.opts.device in {"CUDA", "HSA", "AMD", "NV"} else 0
+  if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
+    beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
+
+  min_progress_micros = getenv("BEAM_MIN_PROGRESS", 0.01)
 
   try:
     rawbufs = _ensure_buffer_alloc(rawbufs)
@@ -132,7 +135,7 @@ def beam_search(lin:Linearizer, rawbufs:List[Buffer], amt:int, allow_test_size=T
         try: tms = _time_program(vars, outcount, dev, lib, global_size, local_size, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0)
         except RuntimeError: continue # for runtime issues
         timed_lins.append((acted_lins[i], min(tms)))
-        if getenv("BEAM_LOG", 0) > 0: print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {num_uops:5d} uops {compile_et*1e6:12.2f} us compile/{timed_lins[-1][1]*1e6:12.2f} us run       {len(timed_lins):4d}/{len(acted_lins):4d}         {timed_lins[-1][0].colored_shape()}")  # noqa: E501
+        if getenv("BEAM_LOG") > 0: print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {num_uops:5d} uops {compile_et*1e6:12.2f} us compile/{timed_lins[-1][1]*1e6:12.2f} us run       {len(timed_lins):4d}/{len(acted_lins):4d}         {timed_lins[-1][0].colored_shape()}")  # noqa: E501
         elif DEBUG >= 2: print(f"\r{time.perf_counter() - st:7.2f}s: {timed_lins[-1][1]*1e6:12.2f} us       {len(timed_lins):4d}/{len(acted_lins):4d}         {timed_lins[-1][0].colored_shape()}\033[K", end="")  # noqa: E501
 
       # done
