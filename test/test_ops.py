@@ -298,7 +298,15 @@ class TestOps(unittest.TestCase):
   def test_tril(self):
     helper_test_op([(3,3)], lambda x: x.tril())
     helper_test_op([(3,3)], lambda x: x.tril(1))
+    helper_test_op([(3,3)], lambda x: x.tril(2))
     helper_test_op([(3,3)], lambda x: x.tril(-1))
+    helper_test_op([(3,3)], lambda x: x.tril(-2))
+    helper_test_op([(4,5)], lambda x: x.tril(4))
+    helper_test_op([(4,5)], lambda x: x.tril(5))
+    helper_test_op([(4,5)], lambda x: x.tril(6))
+    helper_test_op([(4,5)], lambda x: x.tril(-4))
+    helper_test_op([(4,5)], lambda x: x.tril(-5))
+    helper_test_op([(4,5)], lambda x: x.tril(-6))
     helper_test_op([(5,3,3)], lambda x: x.tril())
     helper_test_op([(5,0,3)], lambda x: x.tril())
     helper_test_op([(5,3,3)], lambda x: x.tril(1))
@@ -306,7 +314,15 @@ class TestOps(unittest.TestCase):
   def test_triu(self):
     helper_test_op([(3,3)], lambda x: x.triu())
     helper_test_op([(3,3)], lambda x: x.triu(1))
+    helper_test_op([(3,3)], lambda x: x.triu(2))
     helper_test_op([(3,3)], lambda x: x.triu(-1))
+    helper_test_op([(3,3)], lambda x: x.triu(-2))
+    helper_test_op([(4,5)], lambda x: x.triu(4))
+    helper_test_op([(4,5)], lambda x: x.triu(5))
+    helper_test_op([(4,5)], lambda x: x.triu(6))
+    helper_test_op([(4,5)], lambda x: x.triu(-4))
+    helper_test_op([(4,5)], lambda x: x.triu(-5))
+    helper_test_op([(4,5)], lambda x: x.triu(-6))
     helper_test_op([(5,3,3)], lambda x: x.triu())
     helper_test_op([(5,0,3)], lambda x: x.triu())
     helper_test_op([(5,3,3)], lambda x: x.triu(1))
@@ -329,6 +345,8 @@ class TestOps(unittest.TestCase):
 
   def test_tiny_add(self):
     helper_test_op([(3), (3)], lambda x,y: x+y, Tensor.add, forward_only=True)
+  def test_tiny_mul(self):
+    helper_test_op([(64), (64)], lambda x,y: x*y, Tensor.mul, forward_only=True)
 
   def test_add(self):
     helper_test_op([(45,68), (45,68)], lambda x,y: x+y, Tensor.add)
@@ -448,6 +466,20 @@ class TestOps(unittest.TestCase):
     helper_test_op([], lambda: tor^tor, lambda: ten^ten, forward_only=True)
     helper_test_op([], lambda: tor^0x1337, lambda: ten^0x1337, forward_only=True)
     helper_test_op([], lambda: 0x1337^tor, lambda: 0x1337^ten, forward_only=True)
+
+  def test_and(self):
+    tor = torch.tensor([[1,-8,1],[32,1,6]], dtype=torch.int)
+    ten = Tensor([[1,-8,1],[32,1,6]], dtype=dtypes.int32)
+    helper_test_op([], lambda: tor&tor, lambda: ten&ten, forward_only=True)
+    helper_test_op([], lambda: tor&0x1337, lambda: ten&0x1337, forward_only=True)
+    helper_test_op([], lambda: 0x1337&tor, lambda: 0x1337&ten, forward_only=True)
+
+  def test_or(self):
+    tor = torch.tensor([[1,-8,1],[32,1,6]], dtype=torch.int)
+    ten = Tensor([[1,-8,1],[32,1,6]], dtype=dtypes.int32)
+    helper_test_op([], lambda: tor|tor, lambda: ten|ten, forward_only=True)
+    helper_test_op([], lambda: tor|0x1337, lambda: ten|0x1337, forward_only=True)
+    helper_test_op([], lambda: 0x1337|tor, lambda: 0x1337|ten, forward_only=True)
 
   def test_lshift(self):
     data = [[0,1,2],[1<<8,1<<16,1<<31-1]]
@@ -733,6 +765,12 @@ class TestOps(unittest.TestCase):
     helper_test_op([(4,3), (1,3,3,5)], lambda x,y: x.matmul(y), Tensor.dot)
   def test_small_gemm(self):
     helper_test_op([(8,8), (8,8)], lambda x,y: x.matmul(y), lambda x,y: x@y)
+  def test_9_gemm(self):
+    helper_test_op([(9,9), (9,9)], lambda x,y: x.matmul(y), lambda x,y: x@y)
+  def test_small_gemm_padded(self):
+    helper_test_op([(9,9), (9,9)],
+                   lambda x,y: torch.nn.functional.pad(x, (0,7,0,7)).matmul(torch.nn.functional.pad(y, (0,7,0,7))),
+                   lambda x,y: x.pad(((0,7),(0,7)))@y.pad(((0,7),(0,7))))
   def test_small_gemm_range(self):
     helper_test_op(None, lambda x,y: x.matmul(y), lambda x,y: x@y, vals=[np.arange(0,64,dtype=np.float32).reshape(8,8),
                                                                          np.arange(64,128,dtype=np.float32).reshape(8,8)])
@@ -776,7 +814,14 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=(0,2)))
     helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=(1,2)))
     helper_test_op([(3,4,5,6)], lambda x: x.sum(axis=1))
-    helper_test_op([()], lambda x: x.sum(), Tensor.sum)
+    helper_test_op([()], lambda x: x.sum())
+    helper_test_op([()], lambda x: x.sum(0))
+    helper_test_op([()], lambda x: x.sum(-1))
+    helper_test_op([()], lambda x: x.sum(()))
+    self.helper_test_exception([(3,4,5,6)], lambda x: x.sum(5), lambda x: x.sum(5), expected=IndexError)
+    self.helper_test_exception([()], lambda x: x.sum(1), lambda x: x.sum(1), expected=IndexError)
+    self.helper_test_exception([()], lambda x: x.sum((1,)), lambda x: x.sum((1,)), expected=IndexError)
+
   def test_sum_with_zeros_shape(self):
     helper_test_op([(4, 0)], lambda x: x.sum(axis=(0,)))
     helper_test_op([(4, 0)], lambda x: x.sum(axis=(1,)))
@@ -793,6 +838,32 @@ class TestOps(unittest.TestCase):
     helper_test_op(None, lambda x: x.max().mul(0.5), vals=[[[1.0,1.0,0.0,1.0]],])
     helper_test_op([(3,4,5,6)], lambda x: x.max(axis=1)[0], lambda x: x.max(axis=1))
     helper_test_op([()], lambda x: x.max())
+
+  @unittest.skipIf(getenv("PTX"), "broken in PTX")
+  def test_any(self):
+    helper_test_op([(3,4,5,6)], lambda x: x.any(), forward_only=True)
+    helper_test_op(None, lambda x: x.any(), vals=[[True, True]], forward_only=True)
+    helper_test_op(None, lambda x: x.any(), vals=[[True, False]], forward_only=True)
+    helper_test_op(None, lambda x: x.any(), vals=[[False, False]], forward_only=True)
+    helper_test_op([()], lambda x: x.any(), forward_only=True)
+  @unittest.skipIf(getenv("PTX"), "broken in PTX")
+  def test_any_axis(self):
+    helper_test_op([(3,4,5,6)], lambda x: x.any(axis=(1,2)), forward_only=True)
+  def test_any_zero_axis(self):
+    helper_test_op([(1,0,3,0,5)], lambda x: x.any(axis=(1,3)), forward_only=True)
+
+  @unittest.skipIf(getenv("PTX"), "broken in PTX")
+  def test_all(self):
+    helper_test_op([(3,4,5,6)], lambda x: x.all(), forward_only=True)
+    helper_test_op(None, lambda x: x.all(), vals=[[True, True]], forward_only=True)
+    helper_test_op(None, lambda x: x.all(), vals=[[True, False]], forward_only=True)
+    helper_test_op(None, lambda x: x.all(), vals=[[False, False]], forward_only=True)
+    helper_test_op([()], lambda x: x.all(), forward_only=True)
+  @unittest.skipIf(getenv("PTX"), "broken in PTX")
+  def test_all_axis(self):
+    helper_test_op([(3,4,5,6)], lambda x: x.all(axis=(1,2)), forward_only=True)
+  def test_all_zero_axis(self):
+    helper_test_op([(1,0,3,0,5)], lambda x: x.all(axis=(1,3)), forward_only=True)
 
   def test_mean(self):
     helper_test_op([(3,4,5,6)], lambda x: x.mean())
@@ -1039,10 +1110,10 @@ class TestOps(unittest.TestCase):
   def test_slice_errors(self):
     a = Tensor.ones(4, 3)
     b = Tensor(2)
-    with self.assertRaises(IndexError): a[1, 77, 77, 77] # IndexError: (finds too many indices before the out of bounds)
-    with self.assertRaises(IndexError): a[1, 3] # IndexError: (out of bounds).
-    with self.assertRaises(IndexError): a[1, -4]
-    with self.assertRaises(IndexError): a[..., ...] # IndexError: only single ellipsis
+    with self.assertRaisesRegex(IndexError, "too many"): a[1, 77, 77, 77] # IndexError: (finds too many indices before the out of bounds)
+    with self.assertRaisesRegex(IndexError, "out of bounds"): a[1, 3] # IndexError: (out of bounds).
+    with self.assertRaisesRegex(IndexError, "out of bounds"): a[1, -4]
+    with self.assertRaisesRegex(IndexError, "single ellipsis"): a[..., ...] # IndexError: only single ellipsis
     with self.assertRaises(ValueError): a[::0, 1] # no 0 strides
     with self.assertRaises(IndexError): b[:] # slice cannot be applied to a 0-dim tensor
 
@@ -1052,6 +1123,13 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3,3,3,3)], lambda x: x[0, ..., 0])
     helper_test_op([(3,3,3,3)], lambda x: x[0:3, ..., 2:3])
     helper_test_op([(3,3,3,3)], lambda x: x[None, 0:3, ..., 0, None])
+
+  # this was the failure in llama early realizing freqs_cis
+  def test_double_slice(self):
+    helper_test_op([(4,4)], lambda x: x[:, 1:2][1:2])
+    helper_test_op([(4,4)], lambda x: x[1:3][1:2])
+    helper_test_op([(4,4)], lambda x: x[:, 1:2][0:1])
+    helper_test_op([(4,4)], lambda x: x[:, 1:2][:, 0:1])
 
   def test_pad2d(self):
     helper_test_op([(3,3,3,3)], lambda x: torch.nn.functional.pad(x, (1,2,3,4)), lambda x: x.pad2d(padding=(1,2,3,4)))
@@ -1112,19 +1190,27 @@ class TestOps(unittest.TestCase):
     helper_test_op([(3,3)], lambda x: x.T)
     helper_test_op([(3,3,3)], lambda x: x.transpose(1,2))
     helper_test_op([(3,3,3)], lambda x: x.transpose(0,2))
+
+  def test_permute(self):
     helper_test_op([(1,2,3,4)], lambda x: x.permute((3,0,2,1)))
     helper_test_op([(3,4,5,6)], lambda x: x.permute((3,2,1,0)))
+    helper_test_op([(3,4,5,6)], lambda x: x.permute((-2,-1,1,0)))
     helper_test_op([()], lambda x: x.permute(()))
+    self.helper_test_exception([(3,4,5,6)], lambda x: x.permute((0,2)), lambda x: x.permute((0,2)), expected=RuntimeError)
+    self.helper_test_exception([(3,4,5,6)], lambda x: x.permute((0,1,2,3,3,3)), lambda x: x.permute((0,1,2,3,3,3)), expected=RuntimeError)
+    self.helper_test_exception([(3,4,5,6)], lambda x: x.permute((0,0,1,2,3)), lambda x: x.permute((0,0,1,2,3)), expected=RuntimeError)
 
   def test_reshape(self):
+    helper_test_op([(4,3,6,6)], lambda x: x.reshape((12,6,6)))
     helper_test_op([(4,3,6,6)], lambda x: x.reshape((-1,3,6,6)))
     helper_test_op([(4,3,6,6)], lambda x: x.reshape((-1,1,6,6)))
-    helper_test_op([()], lambda x: x.reshape([]))
-    helper_test_op([(1,)], lambda x: x.reshape([]))
-    helper_test_op([()], lambda x: x.reshape([1]))
-    helper_test_op([()], lambda x: x.reshape([1, 1, 1]))
-    self.helper_test_exception([(3, 4)], lambda x: x.reshape((-1, -1, 2)), lambda x: x.reshape((-1, -1, 2)), expected=RuntimeError)
-    self.helper_test_exception([(3, 4)], lambda x: x.reshape((-1, -1, -1, 2)), lambda x: x.reshape((-1, -1, -1, 2)), expected=RuntimeError)
+    helper_test_op([(4,3,6,6)], lambda x: x.reshape((4,3,6,6)), lambda x: x.reshape((None,None,6,6)))
+    helper_test_op([()], lambda x: x.reshape(()))
+    helper_test_op([(1,)], lambda x: x.reshape(()))
+    helper_test_op([()], lambda x: x.reshape((1,)))
+    helper_test_op([()], lambda x: x.reshape((1,1,1)))
+    self.helper_test_exception([(3,4)], lambda x: x.reshape((-1,-1,2)), lambda x: x.reshape((-1,-1,2)), expected=RuntimeError)
+    self.helper_test_exception([(3,4)], lambda x: x.reshape((-1,-1,-1,2)), lambda x: x.reshape((-1,-1,-1,2)), expected=RuntimeError)
 
     with self.assertRaises(ValueError):
       x = Tensor.ones((4,3,6,6))
@@ -1139,7 +1225,10 @@ class TestOps(unittest.TestCase):
     helper_test_op([(4,3,6,6)], lambda x: x.flip((-1,)))
     helper_test_op([()], lambda x: x.flip(()))
     helper_test_op([(1,)], lambda x: x.flip(()))
-    helper_test_op([(4, 3, 6, 6)], lambda x: x.flip(()))
+    helper_test_op([(4,3,6,6)], lambda x: x.flip(()))
+    self.helper_test_exception([(3,4)], lambda x: x.flip((0,0)), lambda x: x.flip((0,0)), expected=RuntimeError)
+    self.helper_test_exception([(3,4)], lambda x: x.flip((1,1)), lambda x: x.flip((1,1)), expected=RuntimeError)
+    self.helper_test_exception([(3,4)], lambda x: x.flip((1,-1)), lambda x: x.flip((1,-1)), expected=RuntimeError)
 
   def test_squeeze(self):
     helper_test_op([(1,3,6,6)], lambda x: x.squeeze(0))
@@ -1620,6 +1709,11 @@ class TestOps(unittest.TestCase):
 
     np.testing.assert_allclose(x.repeat((2, 0, 4)).numpy(), Tensor.zeros(8, 0, 12).numpy())
 
+  def test_repeat_interleave(self):
+    helper_test_op([(3, 3)], lambda x: x.repeat_interleave(6))
+    helper_test_op([(3, 3)], lambda x: x.repeat_interleave(2, 1))
+    helper_test_op([(3, 3)], lambda x: x.repeat_interleave(2, 0))
+
   def test_simple_repeat(self):
     repeats = [3, 3, 4]
     helper_test_op([(3, 3)], lambda x: x.repeat(*repeats), lambda x: x.repeat(repeats))
@@ -1630,20 +1724,16 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,65)], lambda x: x.clip(10, 100))
     helper_test_op([(45,65)], lambda x: x.clip(0, 0.1))
     helper_test_op([(45,65)], lambda x: x.clip(-0.3, -0.2))
-    helper_test_op([(45,65)], lambda x: x.clip(3, 0))
+    helper_test_op([(45,65)], lambda x: x.clip(3, 0))  # min > max
+    helper_test_op([(45,65)], lambda x: x.clip(None, 0))
+    helper_test_op([(45,65)], lambda x: x.clip(0, None))
+    self.helper_test_exception([(45,65)], lambda x: x.clip(None, None), lambda x: x.clip(None, None), RuntimeError)
 
   def test_matvecmat(self):
     helper_test_op([(1,128), (128,128), (128,128)], lambda x,y,z: (x@y).relu()@z)
 
   def test_matvec(self):
     helper_test_op([(1,128), (128,128)], lambda x,y: (x@y).relu())
-
-  # this was the failure in llama early realizing freqs_cis
-  def test_double_slice(self):
-    helper_test_op([(4,4)], lambda x: x[:, 1:2][1:2])
-    helper_test_op([(4,4)], lambda x: x[1:3][1:2])
-    helper_test_op([(4,4)], lambda x: x[:, 1:2][0:1])
-    helper_test_op([(4,4)], lambda x: x[:, 1:2][:, 0:1])
 
   @unittest.skip("this test is broken #862")
   def test_max_inf(self):
@@ -1775,6 +1865,9 @@ class TestOps(unittest.TestCase):
                    lambda x,y,z,m: torch.nn.functional.scaled_dot_product_attention(x,y,z,attn_mask=m),
                    lambda x,y,z,m: Tensor.scaled_dot_product_attention(x,y,z,attn_mask=m))
 
+  def test_scaled_product_attention_mismatch_ls(self):
+    helper_test_op([(32,8,4,64), (32,8,16,64), (32,8,16,64)], torch.nn.functional.scaled_dot_product_attention, Tensor.scaled_dot_product_attention)
+
   def test_scaled_product_attention_causal(self):
     helper_test_op([(32,8,16,64), (32,8,16,64), (32,8,16,64)],
                    lambda x,y,z: torch.nn.functional.scaled_dot_product_attention(x,y,z,is_causal=True),
@@ -1801,6 +1894,13 @@ class TestOps(unittest.TestCase):
   def test_masked_fill(self):
     helper_test_op([(32,10)], lambda x: x.masked_fill((x>0.1).detach(), -math.inf))
     helper_test_op([(32,10)], lambda x: x.masked_fill((x<0.1).detach(), -math.inf))
+
+  def test_cast(self):
+    helper_test_op([(3, 3)], lambda x: x.float())
+    helper_test_op(None, lambda x: x.float(), vals=[[0, 1, 2, 3]], forward_only=True)
+    helper_test_op(None, lambda x: x.float(), vals=[[True, False]], forward_only=True)
+    helper_test_op([(3, 3)], lambda x: x.int(), forward_only=True)
+    helper_test_op([(3, 3)], lambda x: x.bool(), forward_only=True)
 
 if __name__ == '__main__':
   np.random.seed(1337)

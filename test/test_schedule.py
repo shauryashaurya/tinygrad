@@ -6,14 +6,17 @@ import unittest
 import numpy as np
 from typing import List, Optional, Union
 from tinygrad import nn, dtypes
+from tinygrad.device import Device
 from tinygrad.tensor import Tensor
-from tinygrad.ops import BinaryOps, LoadOps, ReduceOps
+from tinygrad.ops import BinaryOps, LoadOps, ReduceOps, UnaryOps
 from tinygrad.helpers import DEBUG, flatten, getenv
 from tinygrad.codegen.linearizer import Linearizer
 from tinygrad.engine.graph import print_tree
 from tinygrad.engine.schedule import create_schedule
 from tinygrad.engine.realize import run_schedule
 from test.helpers import is_dtype_supported
+from tinygrad.function import Function
+from tinygrad.lazy import LazyBuffer, view_supported_devices
 
 class KernelCountException(Exception): pass
 def check_schedule(t:Union[Tensor, List[Tensor]], allowed:int, to_prerealize:Optional[List[Tensor]]=None, filter_loadops=True):
@@ -31,7 +34,7 @@ def check_schedule(t:Union[Tensor, List[Tensor]], allowed:int, to_prerealize:Opt
     for i, s in enumerate(sched):
       print("kernel", i+1)
       for op in s.ast: print_tree(op)
-  if len(sched) != allowed: raise KernelCountException()
+  if len(sched) != allowed: raise KernelCountException(f"{len(sched)=} != {allowed}")
   # test the (non loadops) ops linearize
   for s in sched:
     if s.ast[0].op in LoadOps: continue
@@ -797,7 +800,7 @@ class TestSchedule(unittest.TestCase):
   def test_scaled_dot_product_attention_causal_fusion(self):
     x, y, z, m = (Tensor.empty(32, 8, 16, 16) for _ in range(4))
     out = Tensor.scaled_dot_product_attention(x, y, z, attn_mask=m, is_causal=True)
-    check_schedule(out, 7)
+    check_schedule(out, 6)
 
   def test_adam_step_fusion(self):
     with Tensor.train():
@@ -1151,6 +1154,23 @@ class TestSchedule(unittest.TestCase):
     p = np.pad(p, (1, 0), 'constant')
     p = np.tile(p, 2)
     np.testing.assert_allclose(tiny_ret, p)
+
+  @unittest.skipIf(Device.DEFAULT not in view_supported_devices, "subbuffer not supported")
+  def test_bitcast_subbufer(self):
+    a = Tensor.empty(1, dtype=dtypes.float32).realize()
+    b = CycleBitcast.apply(a)
+    check_schedule(b, 2) # this should fuse when it makes sense
+
+  def test_bitcast_disable_subbufer(self):
+    a = Tensor.empty(1, dtype=dtypes.float32).realize()
+    b = CycleBitcast.apply(a, allow_buffer_view=False)
+    check_schedule(b, 1)
+
+class CycleBitcast(Function):
+  def forward(self, x: LazyBuffer, allow_buffer_view=True):
+    a = x.e(UnaryOps.NEG).cast(dtypes.int32, True, allow_buffer_view)
+    b = x.cast(dtypes.int32, True, allow_buffer_view)
+    return a.e(BinaryOps.ADD, b)
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)
