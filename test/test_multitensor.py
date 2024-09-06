@@ -1,7 +1,7 @@
 import unittest, functools, random
 from typing import List
 from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes
-from tinygrad.ops import LoadOps, ReduceOps, BufferOps, BinaryOps
+from tinygrad.ops import MetaOps, ReduceOps, BinaryOps, UOps
 from tinygrad.helpers import CI, getenv, prod, Context
 from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.engine.schedule import create_schedule
@@ -144,13 +144,13 @@ class TestMultiTensor(unittest.TestCase):
     O = X.shrink(((0, 2), None)) * W.shrink(((0, 2), None)) < 2
     np.testing.assert_allclose(O.numpy(), X.numpy()[0:2]*W.numpy()[0:2] < 2)
 
-  @given(strat.sampled_from((4, 5)), strat.sampled_from((devices_2, devices_3)), strat.sampled_from((ReduceOps.SUM, ReduceOps.MAX)),
+  @given(strat.sampled_from((4, 5)), strat.sampled_from((devices_2, devices_3)), strat.sampled_from((ReduceOps.SUM, ReduceOps.PROD, ReduceOps.MAX)),
          strat.sampled_from((None, 0, 1)), strat.sampled_from((None, 0, 1)), strat.sampled_from((1, 0, -1)))
   def test_simple_reduce(self, N, devices, rop, shard_axis, reduce_axis, sign):
     X = Tensor.rand(N*N).reshape(N, N).mul(sign)
     n = X.numpy()
     X.shard_(devices, shard_axis)
-    f = {ReduceOps.SUM: lambda x: x.sum(reduce_axis), ReduceOps.MAX: lambda x: x.max(reduce_axis)}[rop]
+    f = {ReduceOps.SUM: lambda x: x.sum(reduce_axis), ReduceOps.PROD: lambda x: x.prod(reduce_axis), ReduceOps.MAX: lambda x: x.max(reduce_axis)}[rop]
     fX = f(X)
     fn = f(n)
     np.testing.assert_allclose(fX.numpy(), fn, rtol=1e-6, atol=1e-6)
@@ -165,7 +165,6 @@ class TestMultiTensor(unittest.TestCase):
       a,b = _test_allreduce(Tensor.rand(256, 256))
       np.testing.assert_almost_equal(a.numpy(), b.numpy(), decimal=5)
 
-  @unittest.skipIf(Device.DEFAULT in ("NV", "AMD"), "not supported in HCQ #4817")
   def test_copy_jit(self):
     @TinyJit
     def copy_tensor(x:Tensor): return (x.to(f"{x.device.split(':')[0]}:1") + 1)
@@ -174,7 +173,6 @@ class TestMultiTensor(unittest.TestCase):
       x = copy_tensor(t)
       np.testing.assert_equal((t+1).numpy(), x.numpy())
 
-  @unittest.skipIf(Device.DEFAULT in ("NV", "AMD"), "not supported in HCQ #4817")
   def test_allreduce_naive_jit(self):
     with Context(RING=0):
       jit_allreduce = TinyJit(_test_allreduce)
@@ -182,7 +180,6 @@ class TestMultiTensor(unittest.TestCase):
         a,b = jit_allreduce(Tensor.rand(256, 256))
         np.testing.assert_almost_equal(a.numpy(), b.numpy(), decimal=5)
 
-  @unittest.skipIf(Device.DEFAULT in ("NV", "AMD"), "not supported in HCQ #4817")
   def test_allreduce_ring_jit(self):
     with Context(RING=2):
       jit_allreduce = TinyJit(_test_allreduce)
@@ -319,7 +316,7 @@ class TestMultiTensor(unittest.TestCase):
     sys.path.append((pathlib.Path(__file__).parent.parent / "extra" / "models").as_posix())
     from resnet import ResNet18
 
-    fake_image = Tensor.rand((2, 3, 224, 224))
+    fake_image = Tensor.rand((2, 3, 224//8, 224//8))
     fake_image_sharded = fake_image.shard(devices_2, axis=0)
     m = ResNet18()
     m.load_from_pretrained()
@@ -332,14 +329,14 @@ class TestMultiTensor(unittest.TestCase):
     shard_output_np = shard_output.numpy()
     np.testing.assert_allclose(real_output, shard_output_np, atol=1e-6, rtol=1e-6)
 
-  @unittest.skipIf(CI and Device.DEFAULT in ("CUDA", "NV"), "slow")
+  @unittest.skipIf(CI and Device.DEFAULT in ("CUDA", "NV", "LLVM"), "slow, and flaky on LLVM")
   def test_data_parallel_resnet_train_step(self):
     import sys, pathlib
     sys.path.append((pathlib.Path(__file__).parent.parent / "extra" / "models").as_posix())
     from resnet import ResNet18
     from tinygrad.nn.optim import LARS
 
-    fake_image = Tensor.rand((2, 3, 224, 224))
+    fake_image = Tensor.rand((2, 3, 224//8, 224//8))
     fake_image_sharded = fake_image.shard(devices_2, axis=0)
     labels = Tensor.randint(2, low=0, high=1000)
     labels_sharded = labels.shard(devices_2, axis=0)
@@ -449,13 +446,40 @@ class TestMultiTensor(unittest.TestCase):
         X = ((Tensor(data).shard(devices, axis=0) + 1).realize() - 1).realize()
         np.testing.assert_equal(X.numpy(), data)
 
+  def test_uneven_shard_with_empty(self):
+    N = 4
+    X = Tensor.rand(16, 1, 17).contiguous().realize()
+    np_x = X.numpy()
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(N))
+
+    # test empty shard
+    np.testing.assert_equal(X.shard(devices, 0, (2, 2, 12, 0)).numpy(), np_x)
+
+    # test reshape with empty shard
+    np.testing.assert_equal(X.shard(devices, 0, (2, 2, 12, 0)).reshape(8, 1, 34).numpy(), np_x.reshape(8, 1, 34))
+
+    # test elementwise with empty shard
+    np.testing.assert_equal((X.shard(devices, 0, (2, 2, 12, 0)) + X.shard(devices, 0, (0, 0, 1, 15))).numpy(), np_x + np_x)
+
+  def test_multiple_uneven_shard(self):
+    N = 4
+    X = Tensor.rand(4, 1, 257).contiguous().realize()
+    Y = Tensor.rand(4, 1, 257).contiguous().realize()
+    np_x, np_y = X.numpy(), Y.numpy()
+    devices = tuple(f"{Device.DEFAULT}:{i}" for i in range(N))
+    X.shard_(devices, 2, (2, 38, 47, 170))
+    Y.shard_(devices, 2, (34, 53, 51, 119))
+    np.testing.assert_equal(X.numpy(), np_x)
+    np.testing.assert_equal(Y.numpy(), np_y)
+    np.testing.assert_equal((X + Y).numpy(), np_x + np_y)
+
   def test_bn_ast_on_devices(self):
     t = Tensor.empty((16, 64, 112, 112)).shard(devices_4, axis=0)
     bn = nn.BatchNorm2d(64)
     for p in get_parameters(bn): p.shard_(devices_4).realize()
 
     out = bn(t)
-    scheds = [sched for sched in create_schedule(out.lazydata.lbs) if sched.outputs[0].device in devices_4 and sched.ast[0].op is not LoadOps.COPY]
+    scheds = [sched for sched in create_schedule(out.lazydata.lbs) if sched.outputs[0].device in devices_4 and sched.ast.op is not MetaOps.COPY]
     assert set(out.device for sched in scheds for out in sched.outputs) == set(devices_4), "should have ast on each shard device"
     asts = [sched.ast for sched in scheds]
     assert len(asts)
@@ -499,16 +523,30 @@ class TestMultiTensor(unittest.TestCase):
       t0.reshape((26*15,7))
 
   def test_reshape_on_axis_uneven(self):
-    t0 = Tensor.rand((4, 8, 15)).shard(devices_3, axis=1)
+    def reshape_helper(t0, t, t_axis):
+      np.testing.assert_allclose(t0.reshape(t.shape).numpy(), t.numpy())
+      assert t.lazydata.axis == t_axis
 
-    # no split axis if uneven
-    with self.assertRaises((AssertionError, ValueError)):
-      t0.reshape((4,4,2,15))
+    t0 = Tensor.rand((4, 42, 15)).shard(devices_3, axis=1, splits=[14, 7, 21])
 
-    # ok to split reshape left and right though
-    t1 = t0.reshape(2, 2, 8, 3, 5)
-    np.testing.assert_allclose(t0.numpy().flatten(), t1.numpy().flatten())
-    assert t1.lazydata.axis == 2
+    # ok to reshape as long as elements remain on same device
+    reshape_helper(t0, t0.reshape(2, 2, 42, 3, 5), 2)
+    # split to the right
+    reshape_helper(t0, t0.reshape(2, 2, 6, 7, 15), 2)
+    # split off and merge to the right
+    reshape_helper(t0, t0.reshape(4, 6, 105), 1)
+    # really blend the axes together
+    reshape_helper(t0, t0.reshape(4, 30, 21), 1)
+    # split off 1-shape
+    reshape_helper(t0, t0.reshape(4, 1, 42, 15), 2)
+    reshape_helper(t0, t0.reshape(4, 6, 1, 7, 15), 1)
+
+    # assert if cannot maintain shard axis without moving items between devices
+    with self.assertRaises(AssertionError): t0.reshape(4, 7, 6, 15)
+    # assert for degenerate reshape
+    with self.assertRaises(AssertionError): t0.reshape(4, 5, 7, 15)
+    # assert for cannot maintain axis
+    with self.assertRaises(AssertionError): t0.reshape(4, 3, 2, 7, 15)
 
   def test_mlb_assign_change_axis(self):
     t_none = Tensor.zeros((16, 16)).shard(devices_2).contiguous().realize()
@@ -530,25 +568,25 @@ class TestMultiTensor(unittest.TestCase):
       t = Tensor.zeros(16, 16).contiguous().shard(devices_4, axis).realize()
       t = t + 1
       for si in t.schedule():
-        ast = si.ast[0]
-        assert ast.op is BufferOps.STORE
-        assert ast.src[0].op is BinaryOps.ADD
-        assert ast.src[0].src[0].op is BufferOps.LOAD and ast.src[0].src[0]
-        assert ast.src[0].src[1].op is BufferOps.CONST and ast.src[0].src[1].arg.val == 1
+        ast = si.ast.src[0]
+        assert ast.op is UOps.STORE
+        assert ast.src[2].arg is BinaryOps.ADD
+        assert ast.src[2].src[0].op is UOps.LOAD and ast.src[2].src[0]
+        assert ast.src[2].src[1].op is UOps.CONST and ast.src[2].src[1].arg == 1
       t = 2 * t
       for si in t.schedule():
-        ast = si.ast[0]
-        assert ast.op is BufferOps.STORE
-        assert ast.src[0].op is BinaryOps.MUL
-        assert ast.src[0].src[0].op is BufferOps.CONST and ast.src[0].src[0].arg.val == 2
-        assert ast.src[0].src[1].op is BufferOps.LOAD
+        ast = si.ast.src[0]
+        assert ast.op is UOps.STORE
+        assert ast.src[2].arg is BinaryOps.MUL
+        assert ast.src[2].src[0].op is UOps.CONST and ast.src[2].src[0].arg == 2
+        assert ast.src[2].src[1].op is UOps.LOAD
       t = t + t.full_like(3)
       for si in t.schedule():
-        ast = si.ast[0]
-        assert ast.op is BufferOps.STORE
-        assert ast.src[0].op is BinaryOps.ADD
-        assert ast.src[0].src[0].op is BufferOps.LOAD
-        assert ast.src[0].src[1].op is BufferOps.CONST and ast.src[0].src[1].arg.val == 3
+        ast = si.ast.src[0]
+        assert ast.op is UOps.STORE
+        assert ast.src[2].arg is BinaryOps.ADD
+        assert ast.src[2].src[0].op is UOps.LOAD
+        assert ast.src[2].src[1].op is UOps.CONST and ast.src[2].src[1].arg == 3
 
   def test_shard_memory(self):
     devices = (d0, d1, d2, d3)
@@ -844,6 +882,26 @@ class TestBatchNorm(unittest.TestCase):
     # TODO: test synced / unsynced batchnorm cross device kernel and copies
     assert synced_si
     assert unsynced_si
+
+def helper_test_shard_op(shps, fxn, atol=1e-6, rtol=1e-3):
+  for shp in shps:
+    single_in = Tensor.randn(shp)
+    multi_in  = single_in.shard(devices_2, axis=0)
+
+    single_out = fxn(single_in).numpy()
+    multi_out  = fxn(multi_in).numpy()
+
+    try:
+      assert single_out.shape == multi_out.shape, f"shape mismatch: single={single_out.shape} | multi={multi_out.shape}"
+      assert single_out.dtype == multi_out.dtype, f"dtype mismatch: single={single_out.dtype} | multi={multi_out.dtype}"
+      np.testing.assert_allclose(single_out, multi_out, atol=atol, rtol=rtol)
+    except Exception as e:
+      raise Exception(f"Failed shape {single_out.shape}: {e}")
+
+@unittest.skipIf(CI and Device.DEFAULT in ("GPU", "CUDA", "METAL"), "no GPU CI")
+class TestTensorOps(unittest.TestCase):
+  def test_interpolate(self):
+    helper_test_shard_op([(4,16,16),(4,24,24)], lambda x: Tensor.interpolate(x, (19,19)))
 
 if __name__ == '__main__':
   unittest.main()
