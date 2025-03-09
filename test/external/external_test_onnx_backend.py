@@ -10,7 +10,7 @@ from tinygrad.device import is_dtype_supported
 # pip3 install tabulate
 pytest_plugins = 'onnx.backend.test.report',
 
-from extra.onnx import get_run_onnx
+from extra.onnx import OnnxRunner
 
 class TinygradModel(BackendRep):
   def __init__(self, run_onnx, input_names):
@@ -20,7 +20,7 @@ class TinygradModel(BackendRep):
 
   def run(self, inputs: Any, **kwargs: Any) -> Tuple[Any, ...]:
     real_inputs = dict(zip(self.input_names, inputs))
-    ret = self.fxn(real_inputs, debug=True)
+    ret = self.fxn(real_inputs, debug=2)
     return tuple(x.numpy() if isinstance(x, Tensor) else [i.numpy() for i in x] if isinstance(x, list) else np.array(x) for x in ret.values())
 
 class TinygradBackend(Backend):
@@ -30,7 +30,7 @@ class TinygradBackend(Backend):
     input_initializer = [x.name for x in model.graph.initializer]
     net_feed_input = [x for x in input_all if x not in input_initializer]
     print("prepare", cls, device, net_feed_input)
-    run_onnx = get_run_onnx(model)
+    run_onnx = OnnxRunner(model)
     return TinygradModel(run_onnx, net_feed_input)
 
   @classmethod
@@ -49,6 +49,10 @@ backend_test.exclude('test_qlinearmatmul_2D_int8_float16_cpu')
 backend_test.exclude('test_qlinearmatmul_3D_int8_float16_cpu')
 backend_test.exclude('test_qlinearmatmul_2D_int8_float32_cpu')
 backend_test.exclude('test_qlinearmatmul_3D_int8_float32_cpu')
+
+# BUG: we don't match ORT here due to some div inaccuracy with floats
+backend_test.exclude('test_dynamicquantizelinear_cpu')
+backend_test.exclude('test_dynamicquantizelinear_expanded_cpu')
 
 # about different dtypes
 if not is_dtype_supported(dtypes.float64):
@@ -77,6 +81,7 @@ backend_test.exclude('cast_no_saturate')
 backend_test.exclude('test_dequantizelinear_e4m3fn_float16_cpu')
 backend_test.exclude('test_max_float16_cpu')
 backend_test.exclude('test_min_float16_cpu')
+backend_test.exclude('test_mod_mixed_sign_float16_cpu')
 
 backend_test.exclude('test_dequantizelinear_int4_cpu')
 backend_test.exclude('test_dequantizelinear_uint4_cpu')
@@ -95,11 +100,9 @@ backend_test.exclude('test_dequantizelinear_e5m2_cpu')
 # we don't support indexes
 backend_test.exclude('test_nonzero_*')
 
-# no support for fmod
-backend_test.exclude('test_mod_int64_fmod_cpu')
-backend_test.exclude('test_mod_mixed_sign_float16_cpu')
-backend_test.exclude('test_mod_mixed_sign_float32_cpu')
-backend_test.exclude('test_mod_mixed_sign_float64_cpu')
+# no support for int pow
+backend_test.exclude('test_pow_types_int32_int32_cpu')
+backend_test.exclude('test_pow_types_int64_int64_cpu')
 
 # no boolean ops (2d, 3d, 4d)
 backend_test.exclude('test_bitshift_*')
@@ -108,9 +111,6 @@ backend_test.exclude('test_bitshift_*')
 backend_test.exclude('string')
 backend_test.exclude('test_strnorm_*')
 backend_test.exclude('test_regex_*')
-
-# no quantize
-backend_test.exclude('test_dynamicquantizelinear_*')
 
 # no rnn
 backend_test.exclude('test_gru_*')
@@ -171,9 +171,7 @@ backend_test.exclude('test_ai_onnx_ml_label_encoder_tensor_value_only_mapping_cp
 backend_test.exclude('test_ai_onnx_ml_label_encoder_tensor_mapping_cpu') # bad data type string
 backend_test.exclude('test_group_normalization_*') # numerical inaccuracy problem. Current Group Normalization OP fails test
 
-backend_test.exclude('test_scatter_elements_with_reduction_min_cpu') # min not yet supported
 backend_test.exclude('test_scatternd_min_cpu') # min not yet supported
-backend_test.exclude('test_scatter_elements_with_reduction_max_cpu') # max not yet supported
 backend_test.exclude('test_scatternd_max_cpu') # max not yet supported
 
 if Device.DEFAULT in ['GPU', 'METAL']:

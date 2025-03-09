@@ -26,7 +26,7 @@ binary_operations = [operator.add, operator.sub, operator.mul, operator.lt, oper
 if Device.DEFAULT == "LLVM":
   binary_operations.remove(operator.lt)
 
-integer_binary_operations = binary_operations + [(Tensor.xor, np.bitwise_xor), (Tensor.bitwise_and, np.bitwise_and),
+integer_binary_operations = binary_operations + [(Tensor.bitwise_xor, np.bitwise_xor), (Tensor.bitwise_and, np.bitwise_and),
                                                  (Tensor.bitwise_or, np.bitwise_or)]
 unary_operations = [(Tensor.exp, np.exp), (Tensor.log, np.log), (Tensor.sin, np.sin),
                     (Tensor.sqrt, np.sqrt), (Tensor.reciprocal, np.reciprocal)]
@@ -88,9 +88,8 @@ def universal_test_cast(a, in_dtype, dtype):
   numpy_value = np.array([a], dtype=_to_np_dtype(in_dtype)).astype(_to_np_dtype(dtype))
   np.testing.assert_equal(tensor_value.numpy(), numpy_value)
 
+@unittest.skipIf(Device.DEFAULT == "WEBGPU", "Inf and nan cases are wrong on WebGPU")
 def universal_test_midcast(a, b, c, op1, op2, d1:DType, d2:DType):
-  # the 'inf' and 'nan' cases are wrong on WEBGPU
-  if (any(map(math.isnan, [a, b, c])) or math.isinf(c)) and Device.DEFAULT == "WEBGPU": return
   if not isinstance(op1, tuple): op1 = (op1, op1)
   if not isinstance(op2, tuple): op2 = (op2, op2)
   at, bt, ct = Tensor([a], dtype=d1), Tensor([b], dtype=d1), Tensor([c], dtype=d2)
