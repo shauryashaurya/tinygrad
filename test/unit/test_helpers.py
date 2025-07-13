@@ -1,9 +1,9 @@
-import gzip, unittest
+import ctypes, gzip, unittest
 from tinygrad import Variable
-from tinygrad.helpers import Context, ContextVar
-from tinygrad.helpers import merge_dicts, strip_parens, prod, round_up, fetch, fully_flatten, from_mv, to_mv, polyN, time_to_str
-from tinygrad.tensor import get_shape
-from tinygrad.codegen.lowerer import get_contraction
+from tinygrad.helpers import Context, ContextVar, argfix, colored, word_wrap, is_numpy_ndarray
+from tinygrad.helpers import merge_dicts, strip_parens, prod, round_up, fetch, fully_flatten, from_mv, to_mv, polyN, time_to_str, cdiv, cmod, getbits
+from tinygrad.tensor import Tensor, get_shape
+from tinygrad.shape.view import get_contraction, get_contraction_with_reduce
 import numpy as np
 
 VARIABLE = ContextVar("VARIABLE", 0)
@@ -155,6 +155,10 @@ class TestFetch(unittest.TestCase):
     with self.assertRaises(gzip.BadGzipFile):
       fetch(no_gzip_url, gunzip=True)
 
+  def test_fetch_user_agent(self):
+    fetch("https://csrc.nist.gov/CSRC/media/Projects/lightweight-cryptography/documents/finalist-round/updated-submissions/sparkle.zip",
+          allow_caching=False)
+
 class TestFullyFlatten(unittest.TestCase):
   def test_fully_flatten(self):
     self.assertEqual(fully_flatten([[1, 3], [1, 2]]), [1, 3, 1, 2])
@@ -178,11 +182,25 @@ class TestMemoryview(unittest.TestCase):
   def test_from_mv_to_mv(self):
     base = memoryview(bytearray(b"\x11\x22\x33"*40))
     ct = from_mv(base)
-    mv = to_mv(ct, len(base))
+    mv = to_mv(ctypes.addressof(ct), len(base))
     mv[0] = 2
     assert base[0] == 2
 
 class TestGetContraction(unittest.TestCase):
+  def test_contraction_with_reduce(self):
+    r = get_contraction((16, 1, 1, 1), (16, 1, 1))
+    self.assertEqual(r, [[0], [], [1, 2, 3]])
+    r = get_contraction_with_reduce((16, 1, 1, 1), (16, 1, 1), (1,))
+    self.assertEqual(r, [[0], [1, 2], [3]])
+
+    r = get_contraction((16, 1, 1, 1, 1), (16, 1, 1, 1))
+    self.assertEqual(r, [[0], [], [], [1, 2, 3, 4]])
+    r = get_contraction_with_reduce((16, 1, 1, 1, 1), (16, 1, 1, 1), (1,))
+    self.assertEqual(r, [[0], [1, 2], [3], [4]])
+
+    r = get_contraction_with_reduce((2, 512, 1, 1), (2, 1, 512), (1,))
+    self.assertIsNone(r)
+
   def test_contraction(self):
     r = get_contraction((1,2,3,4), (2,3,4))
     self.assertEqual(r, [[0, 1], [2], [3]])
@@ -276,7 +294,7 @@ class TestPolyN(unittest.TestCase):
 
   def test_uop(self):
     from tinygrad.dtype import dtypes
-    from tinygrad.ops import UOp
+    from tinygrad.uop.ops import UOp
     from test.helpers import eval_uop
     np.testing.assert_allclose(eval_uop(polyN(UOp.const(dtypes.float, 1.0), [1.0, -2.0, 1.0])), 0.0)
     np.testing.assert_allclose(eval_uop(polyN(UOp.const(dtypes.float, 2.0), [1.0, -2.0, 1.0])), 1.0)
@@ -291,6 +309,85 @@ class TestTimeToStr(unittest.TestCase):
   def test_microseconds(self):      self.assertEqual("  100.00us", time_to_str(0.0001))
   def test_zero(self):              self.assertEqual("    0.00us", time_to_str(0))
   def test_width_formatting(self):  self.assertEqual(" 10.01s ", time_to_str(10.01, w=6))
+
+class TestCStyleDivMod(unittest.TestCase):
+  def test_div_pos(self):
+    self.assertEqual(cdiv(-9, 5), -1)
+    self.assertEqual(cdiv(-4, 5), 0)
+    self.assertEqual(cdiv(0, 5), 0)
+    self.assertEqual(cdiv(4, 5), 0)
+    self.assertEqual(cdiv(9, 5), 1)
+  def test_div_neg(self):
+    self.assertEqual(cdiv(-9, -5), 1)
+    self.assertEqual(cdiv(-4, -5), 0)
+    self.assertEqual(cdiv(0, -5), 0)
+    self.assertEqual(cdiv(4, -5), 0)
+    self.assertEqual(cdiv(9, -5), -1)
+  def test_mod_pos(self):
+    self.assertEqual(cmod(-9, 5), -4)
+    self.assertEqual(cmod(-4, 5), -4)
+    self.assertEqual(cmod(0, 5), 0)
+    self.assertEqual(cmod(4, 5), 4)
+    self.assertEqual(cmod(9, 5), 4)
+  def test_mod_neg(self):
+    self.assertEqual(cmod(-9, -5), -4)
+    self.assertEqual(cmod(-4, -5), -4)
+    self.assertEqual(cmod(0, -5), 0)
+    self.assertEqual(cmod(4, -5), 4)
+    self.assertEqual(cmod(9, -5), 4)
+
+class TestGetBits(unittest.TestCase):
+  def test_low_bits(self):
+    self.assertEqual(getbits(0b11010110, 0, 3), 0b0110)
+
+  def test_high_bits(self):
+    self.assertEqual(getbits(0b11010110, 4, 7), 0b1101)
+
+  def test_middle_bits(self):
+    self.assertEqual(getbits(0b11010110, 3, 5), 0b010)
+
+  def test_full_range(self):
+    self.assertEqual(getbits(0b11010110, 0, 7), 0b11010110)
+
+  def test_single_bit(self):
+    self.assertEqual(getbits(0b100000000, 8, 8), 1)
+
+class TestArgFix(unittest.TestCase):
+  def test_none(self):
+    self.assertEqual(argfix(None), (None, ))
+    self.assertEqual(argfix(None, None), (None, None))
+  def test_positional_arguments(self):
+    self.assertEqual(argfix(1, 2, 3), (1, 2, 3))
+  def test_tuple(self):
+    self.assertEqual(argfix((1., 2., 3.)), (1., 2., 3.))
+  def test_list(self):
+    self.assertEqual(argfix([True, False]), (True, False))
+
+class TestWordWrap(unittest.TestCase):
+  def test_wrap_simple(self):
+    wrap = 10
+    st = "x"*wrap*2
+    st2 = word_wrap(st, wrap)
+    self.assertEqual(len(st2.splitlines()), 2)
+
+  def test_wrap_colored(self):
+    wrap = 10
+    st = colored("x"*wrap*2, "red")
+    st2 = word_wrap(st, wrap=wrap)
+    self.assertEqual(len(st2.splitlines()), 2)
+
+class TestIsNumpyNdarray(unittest.TestCase):
+  def test_ndarray(self):
+    self.assertTrue(is_numpy_ndarray(np.array([1, 2, 3])))
+  def test_ndarray_tolist(self):
+    self.assertFalse(is_numpy_ndarray(np.array([1, 2, 3]).tolist()))
+  def test_list(self):
+    self.assertFalse(is_numpy_ndarray([1, 2, 3]))
+  def test_tensor(self):
+    self.assertFalse(is_numpy_ndarray(Tensor([1, 2, 3])))
+    self.assertFalse(is_numpy_ndarray(Tensor(np.array([1, 2, 3]))))
+  def test_tensor_numpy(self):
+    self.assertTrue(is_numpy_ndarray(Tensor([1, 2, 3]).numpy()))
 
 if __name__ == '__main__':
   unittest.main()

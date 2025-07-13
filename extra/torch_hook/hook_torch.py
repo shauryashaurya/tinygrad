@@ -39,7 +39,7 @@ class DispatchLog(TorchDispatchMode):
     should_call_tiny = kwargs.get('device') is not None and kwargs['device'].type == "cuda"
 
     def can_print_arg(arg):
-      return args is None or isinstance(arg, str) or isinstance(arg, int) or isinstance(arg, float) or isinstance(arg, bool)
+      return args is None or isinstance(arg, (str, int, float, bool))
 
     def create_tiny_mapping(arg):
       if WRAP_TINY:
@@ -113,7 +113,7 @@ class DispatchLog(TorchDispatchMode):
         _ = tiny_x.cpu().numpy()
         if torch.is_tensor(tiny_x) and tiny_x.device.type == "tiny":
           tt = tiny_torch.unwrap(tiny_x)
-          try: out_addr = tt.lazydata.buffer._buf.value
+          try: out_addr = tt.uop.buffer._buf.value
           except Exception: pass
         tiny_events = hook_cuda.collect_events(clear=True)
         print_events(tiny_events, colored("tiny", "magenta"), out_addr)

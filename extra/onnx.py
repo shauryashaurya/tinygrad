@@ -1,65 +1,89 @@
+from types import SimpleNamespace
 from typing import Any, Sequence, cast, Literal, Callable
-import dataclasses, functools, io, math, types
+import dataclasses, functools, io, math, types, warnings, pathlib, sys
 from tinygrad.tensor import Tensor, _broadcast_shape, ReductionStr
-from tinygrad.helpers import getenv, DEBUG, all_same, prod, flatten, make_tuple
-from tinygrad.dtype import DType, ConstType, dtypes, ImageDType
-from tinygrad.device import is_dtype_supported
+from tinygrad.helpers import getenv, DEBUG, all_same, prod, flatten, make_tuple, argsort, is_numpy_ndarray
+from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype
+from tinygrad.device import is_dtype_supported, Device
+from extra.onnx_parser import onnx_load
+
+# https://github.com/onnx/onnx/blob/rel-1.17.0/onnx/onnx.proto3#L500-L544
+data_types: dict[int, DType] = {
+  1:dtypes.float32, 2:dtypes.uint8, 3:dtypes.int8, 4:dtypes.uint16, 5:dtypes.int16, 6:dtypes.int32, 7:dtypes.int64,
+  9:dtypes.bool, 10:dtypes.float16, 11:dtypes.double, 12:dtypes.uint32, 13:dtypes.uint64, 16:dtypes.bfloat16,
+}
+
+# https://github.com/onnx/onnx/blob/rel-1.17.0/onnx/onnx.proto3#L128-L145
+attribute_types: dict[int, Callable] = {
+  1: lambda a: float(a.f),
+  2: lambda a: int(a.i),
+  3: lambda a: a.s.data().tobytes().decode("utf8") if isinstance(a.s, Tensor) else a.s.decode("utf8"),
+  4: lambda a: buffer_parse(a.t),
+  6: lambda a: tuple(float(x) for x in a.floats),
+  7: lambda a: tuple(int(x) for x in a.ints),
+  8: lambda a: tuple(x.data().tobytes().decode("utf8") for x in a.strings)
+}
 
 # ***** protobuf parsing ******
-from onnx import AttributeProto, ModelProto, TensorProto, TypeProto, helper
+from onnx import AttributeProto, TensorProto, TypeProto, helper
 import numpy as np
 
-def dtype_parse(onnx_dtype: int) -> DType:
-  supported: dict[int, DType] = {
-    TensorProto.FLOAT:dtypes.float32, TensorProto.UINT8:dtypes.uint8, TensorProto.INT8:dtypes.int8,
-    TensorProto.UINT16:dtypes.uint16, TensorProto.INT16:dtypes.int16, TensorProto.INT32:dtypes.int32, TensorProto.INT64:dtypes.int64,
-    TensorProto.BOOL:dtypes.bool, TensorProto.FLOAT16:dtypes.float32, TensorProto.DOUBLE:dtypes.double, TensorProto.UINT32:dtypes.uint32,
-    TensorProto.UINT64:dtypes.uint64, TensorProto.BFLOAT16:dtypes.bfloat16,
-  }
-  unsupported = {
-    TensorProto.UNDEFINED, TensorProto.STRING, TensorProto.COMPLEX64, TensorProto.COMPLEX128, TensorProto.FLOAT8E4M3FN, TensorProto.FLOAT8E4M3FNUZ,
-    TensorProto.FLOAT8E5M2, TensorProto.FLOAT8E5M2FNUZ, TensorProto.UINT4, TensorProto.INT4
-  }
-  if onnx_dtype in unsupported: raise NotImplementedError(f"onnx dtype {TensorProto.DataType.Name(onnx_dtype)} is not supported")
-  return supported[onnx_dtype] if is_dtype_supported(supported[onnx_dtype]) else dtypes.float
+def has_field(onnx_type: TypeProto|SimpleNamespace, field):
+  if isinstance(onnx_type, TypeProto): return onnx_type.HasField(field)
+  return hasattr(onnx_type, field)
+
+def dtype_parse(onnx_dtype: int, fallback_context: str | None = None) -> DType:
+  if onnx_dtype not in data_types: raise NotImplementedError(f"onnx dtype id {onnx_dtype} is not supported")
+  if is_dtype_supported(dtype := data_types[onnx_dtype]): return dtype
+  # if fallback_context is provided, we can fall back to a default dtype
+  if fallback_context is not None:
+    default_dtype = dtypes.default_int if dtypes.is_int(dtype) else dtypes.default_float
+    warnings.warn(f"dtype {dtype} on {Device.DEFAULT} from {fallback_context} is not supported, falling back to {default_dtype}")
+    assert is_dtype_supported(default_dtype), f"dtype {default_dtype} must be supported on {Device.DEFAULT}"
+    return default_dtype
+  raise RuntimeError(f"dtype {dtype} on device {Device.DEFAULT} is not supported")
 
 def attribute_parse(onnx_attribute: AttributeProto):
-  supported: dict[AttributeProto.AttributeType, Callable[[AttributeProto], Any]] = {
-    AttributeProto.FLOAT: lambda a: float(a.f), AttributeProto.INT: lambda a: int(a.i),
-    AttributeProto.STRING: lambda a: a.s.decode("utf-8"), AttributeProto.TENSOR: lambda a: buffer_parse(a.t),
-    AttributeProto.FLOATS: lambda a: tuple(float(x) for x in a.floats), AttributeProto.INTS: lambda a: tuple(int(x) for x in a.ints),
-    AttributeProto.STRINGS: lambda a: tuple(x.decode("utf-8") for x in a.strings)
-  }
-  unsupported = {
-    AttributeProto.UNDEFINED, AttributeProto.GRAPH, AttributeProto.SPARSE_TENSOR, AttributeProto.TYPE_PROTO, AttributeProto.TENSORS,
-    AttributeProto.GRAPHS, AttributeProto.SPARSE_TENSORS, AttributeProto.TYPE_PROTOS
-  }
-  if onnx_attribute.type in unsupported:
-    raise NotImplementedError(f"attribute with type {AttributeProto.AttributeType.Name(onnx_attribute.type)} is not supported")
-  return supported[onnx_attribute.type](onnx_attribute)
+  if onnx_attribute.type not in attribute_types: raise NotImplementedError(f"attribute type {onnx_attribute.type} is not supported")
+  return attribute_types[onnx_attribute.type](onnx_attribute)
 
 def buffer_parse(onnx_tensor: TensorProto) -> Tensor:
   if onnx_tensor.string_data: raise NotImplementedError("Parsing for buffer with string data is not implemented.")
-  dtype, shape = dtype_parse(onnx_tensor.data_type), tuple(onnx_tensor.dims)
-  if data := list(onnx_tensor.float_data) or list(onnx_tensor.int32_data) or list(onnx_tensor.int64_data) or list(onnx_tensor.double_data) or \
-             list(onnx_tensor.uint64_data):
-    if len(data) == 1: return Tensor(data[0], dtype=dtype).reshape(shape)
-    return Tensor(data, dtype=dtype).reshape(shape).realize()
-  if onnx_tensor.HasField("raw_data"):
-    np_buffer = np.frombuffer(onnx_tensor.raw_data, dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
-    if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape)
-    return Tensor(np_buffer, dtype=dtype)
+  dtype, shape = dtype_parse(onnx_tensor.data_type, "buffer parse"), tuple(onnx_tensor.dims)
+  data = None
+  if len(onnx_tensor.float_data): data = onnx_tensor.float_data
+  elif len(onnx_tensor.int32_data): data = onnx_tensor.int32_data
+  elif len(onnx_tensor.int64_data): data = onnx_tensor.int64_data
+  elif len(onnx_tensor.double_data): data = onnx_tensor.double_data
+  elif len(onnx_tensor.uint64_data): data = onnx_tensor.uint64_data
+  if isinstance(data, Tensor):
+    if len(data) == 1: return Tensor(data.tolist()[0], dtype=dtype).reshape(shape)
+    return data.cast(dtype).reshape(shape).to(Device.DEFAULT)
+  if has_field(onnx_tensor, "raw_data"):
+    raw_data = onnx_tensor.raw_data
+    if not isinstance(raw_data, Tensor): raw_data = Tensor(raw_data)
+    if not is_dtype_supported(data_types[onnx_tensor.data_type]):
+      np_buffer = np.frombuffer(raw_data.data().tobytes(),
+                                dtype=helper.tensor_dtype_to_np_dtype(onnx_tensor.data_type)).copy().reshape(shape)
+      if np_buffer.size == 1: return Tensor(np_buffer.item(), dtype=dtype).reshape(shape)
+      return Tensor(np_buffer, dtype=dtype)
+    ret = raw_data.bitcast(dtype).reshape(shape).to(Device.DEFAULT)
+    if shape == ():
+      if ret.dtype is dtypes.float16 and sys.version_info < (3, 12): ret = ret.cast(dtypes.float32)
+      ret = Tensor(ret.item(), dtype=dtype).reshape(shape)
+    return ret
   return Tensor(None)
 
 def type_parse(onnx_type: TypeProto):
   elem_type = onnx_type
-  if elem_type.HasField("map_type") or elem_type.HasField("sparse_tensor_type") or elem_type.HasField("opaque_type"):
+  if has_field(elem_type, "map_type") or has_field(elem_type, "sparse_tensor_type") or has_field(elem_type, "opaque_type"):
     raise NotImplementedError("parsing for map_type, sparse_tensor_type and opaque_type are not implemented")
-  if is_optional := elem_type.HasField("optional_type"): elem_type = elem_type.optional_type.elem_type
-  if is_sequence := elem_type.HasField("sequence_type"): elem_type = elem_type.sequence_type.elem_type
-  if elem_type.HasField("tensor_type"):
-    shape = tuple(d.dim_param or d.dim_value for d in elem_type.tensor_type.shape.dim)
-    dtype = dtype_parse(elem_type.tensor_type.elem_type)
+  if is_optional := has_field(elem_type, "optional_type"): elem_type = elem_type.optional_type.elem_type
+  if is_sequence := has_field(elem_type, "sequence_type"): elem_type = elem_type.sequence_type.elem_type
+  if has_field(elem_type, "tensor_type"):
+    shape = tuple(getattr(d, "dim_param", None) or getattr(d, "dim_value") for d in elem_type.tensor_type.shape.dim) \
+      if has_field(elem_type.tensor_type, "shape") else None # test_identity_sequence_cpu
+    dtype = data_types[elem_type.tensor_type.elem_type]
     return OnnxValue(shape, dtype, is_optional, is_sequence)
   raise RuntimeError(f"TypeProto was not parsed properly: {onnx_type=}")
 
@@ -82,14 +106,14 @@ class OnnxNode:
 # ***** python const *****
 required_input_python_consts: dict[str, tuple[int, ...]] = {
   "Tile": (1,), "Range": (0,1,2), "Expand": (1,), "Reshape": (1,), "Squeeze": (1,), "Unsqueeze": (1,), "Trilu": (1,), "ConstantOfShape": (0,),
-  "CumSum": (1,), "Pad": (1,2,3), "MaxUnpool": (2,), "Dropout": (1,2), "CenterCropPad": (1,), "OneHot": (1,), "Compress": (1,),
+  "CumSum": (1,), "TopK": (1,), "Pad": (1,2,3), "MaxUnpool": (2,), "Dropout": (1,2), "CenterCropPad": (1,), "OneHot": (1,), "Compress": (1,),
   "ImageDecoder": (0,), "AffineGrid": (1,), "Resize": (1,2,3), "Upsample": (1,), "Split": (1,), "Slice": (1,2,3,4),
   **{"Reduce"+r: (1,) for r in ("Max", "Min", "Sum", "Mean", "SumSquare", "Prod", "L1", "L2", "LogSum", "LogSumExp")},
   **{optim: (1,) for optim in ("Adam", "Adagrad", "Momentum")}
 }
 
 cache_misses = 0
-@functools.lru_cache(None)
+@functools.cache
 def _cached_to_python_const(t:Tensor):
   if t.dtype is dtypes.uint8: return t.data().tobytes()
   if 0 in t.shape: return []
@@ -109,12 +133,17 @@ def to_python_const(t:Any, op:str, idx:int) -> list[ConstType]|ConstType|bytes:
 debug = int(getenv("DEBUGONNX", "0"))
 limit = int(getenv("ONNXLIMIT", "-1"))
 class OnnxRunner:
-  def __init__(self, model: ModelProto):
-    # parse model protobuf
+  """
+  `OnnxRunner` executes an ONNX model using Tinygrad.
+
+  Args:
+    model_path: The ONNX model, provided as a file path (a string or Path object) or a Tensor.
+  """
+  def __init__(self, model_path: Tensor | str | pathlib.Path):
+    model = onnx_load(model_path)
     self.is_training = any(n.domain in {"ai.onnx.training", "ai.onnx.preview.training"} for n in model.graph.node)
-    self.old_training, self.old_no_grad = Tensor.training, Tensor.no_grad
+    self.old_training = Tensor.training
     Tensor.training = True if self.is_training else False
-    Tensor.no_grad = False if self.is_training else True
     self.graph_values = {"": None, **{x.name:buffer_parse(x) for x in model.graph.initializer}}
     self.graph_inputs = {x.name:type_parse(x.type) for x in model.graph.input if x.name not in self.graph_values}
     self.graph_outputs = tuple(x.name for x in model.graph.output)
@@ -127,17 +156,19 @@ class OnnxRunner:
 
   def _parse_input(self, name: str, value: Any, spec: OnnxValue):
     if spec.is_optional and value is None: return None
-    # TODO: need true float16 for dtype checking
     if spec.is_sequence:
-      if not isinstance(value, Sequence): raise RuntimeError(f"{name} received {value}, expected a sequence type")
+      if not isinstance(value, Sequence): raise RuntimeError(f"input {name} received {value}, expected a sequence type")
       sequence = [Tensor(v, dtype=spec.dtype, requires_grad=self.is_training) if not isinstance(v, Tensor) else v for v in value]
-      if not all_same(tuple(t.shape for t in sequence)): raise RuntimeError(f"Shapes for {name} sequence must be homogeneous")
+      if not all_same(tuple(t.shape for t in sequence)): raise RuntimeError(f"Shapes for input {name} sequence must be homogeneous")
+      if not all(t.dtype is spec.dtype for t in sequence): warnings.warn(f"Dtypes for input {name} sequence aren't all {spec.dtype}")
       return sequence
-    tensor = Tensor(value, dtype=spec.dtype, requires_grad=self.is_training) if not isinstance(value, Tensor) else value
+    dtype = _from_np_dtype(value.dtype) if is_numpy_ndarray(value) else spec.dtype
+    tensor = Tensor(value, dtype=dtype, requires_grad=self.is_training) if not isinstance(value, Tensor) else value
+    if tensor.dtype is not spec.dtype: warnings.warn(f"input {name} has mismatch on dtype. Expected {spec.dtype}, received {tensor.dtype}.")
     for dim, (onnx_dim, user_dim_input) in enumerate(zip(spec.shape, tensor.shape, strict=True)):
       if isinstance(onnx_dim, str):
         onnx_dim = self.variable_dims[onnx_dim] if onnx_dim in self.variable_dims else self.variable_dims.setdefault(onnx_dim, int(user_dim_input))
-      if user_dim_input != onnx_dim: raise RuntimeError(f"{name} has mismatch on {dim=}. Expected {onnx_dim}, received {user_dim_input}.")
+      if user_dim_input != onnx_dim: raise RuntimeError(f"input {name} has mismatch on {dim=}. Expected {onnx_dim}, received {user_dim_input}.")
     return tensor
 
   def _dispatch_op(self, op, inps, opts):
@@ -150,6 +181,15 @@ class OnnxRunner:
       else: real_fxn = fxn
       return real_fxn(*inps, **opts)
     raise NotImplementedError(f"{op=} not supported")
+
+  def get_empty_input_data(self, device:str|None=None, dtype:DType|None=None) -> dict[str, Tensor]:
+    return {name:Tensor.empty(*spec.shape, device=device, dtype=dtype or spec.dtype) for name, spec in self.graph_inputs.items()}
+
+  def to(self, device:str|None):
+    self.graph_values = {k:v.to(device) if isinstance(v, Tensor) else v for k,v in self.graph_values.items()}
+    self.graph_nodes = tuple(OnnxNode(n.num, n.op, tuple(n.inputs), tuple(n.outputs),
+                                      {k:v.to(device) if isinstance(v, Tensor) else v for k,v in n.opts.items()}) for n in self.graph_nodes)
+    return self
 
   def __call__(self, inputs:dict[str, Any], debug=debug):
     for name, input_spec in self.graph_inputs.items():
@@ -173,9 +213,9 @@ class OnnxRunner:
       self.graph_values.update(dict(zip(node.outputs, ret[:len(node.outputs)], strict=True)))
 
       if node.num == limit:
-        Tensor.training, Tensor.no_grad = self.old_training, self.old_no_grad
+        Tensor.training = self.old_training
         return {name:self.graph_values[name] for name in node.outputs}
-    Tensor.training, Tensor.no_grad = self.old_training, self.old_no_grad
+    Tensor.training = self.old_training
     return {name:self.graph_values[name] for name in self.graph_outputs}
 
 ####################
@@ -259,28 +299,29 @@ def get_onnx_ops():
     try: import PIL.Image
     except ImportError as e: raise ImportError("Pillow must be installed for the ImageDecoder operator") from e
     img = PIL.Image.open(io.BytesIO(encoded_stream))
-    if pixel_format == "BGR": return Tensor(np.array(img))[:, :, ::-1]
-    if pixel_format == "RGB": return Tensor(np.array(img))
-    if pixel_format == "Grayscale": return Tensor(np.array(img.convert("L"))).unsqueeze(-1) # (H, W) to (H, W, 1)
+    if pixel_format == "BGR": return Tensor(img.tobytes(), dtype=dtypes.uint8).reshape(*img.size, 3).flip(-1)
+    if pixel_format == "RGB": return Tensor(img.tobytes(), dtype=dtypes.uint8).reshape(*img.size, 3)
+    if pixel_format == "Grayscale": return Tensor(img.convert("L").tobytes(), dtype=dtypes.uint8).reshape(*img.size, 1)
     raise ValueError(f"pixel_format={pixel_format!r} is not supported.")
 
   def EyeLike(x:Tensor, dtype:int|None=None, k:int=0):
-    ret = Tensor.eye(cast(int, min(x.shape)), dtype=dtype_parse(dtype) if dtype is not None else x.dtype)
+    ret = Tensor.eye(cast(int, min(x.shape)), dtype=dtype_parse(dtype, "EyeLike op") if dtype is not None else x.dtype)
     return ret if x.size(0) == x.size(1) else ret.pad(tuple(None if d == ret.size(0) else (k, d-ret.shape[0]-k) for d in x.shape))
 
   def OptionalHasElement(x:Tensor|None=None): return Tensor(x is not None and x.numel() > 0)
   def OptionalGetElement(x:Tensor|None=None): return x if x is not None else Tensor([])
   def ConstantOfShape(shape:list[int], value:Tensor|None=None):
     if value is None: value = Tensor(0, dtype=dtypes.float32)
-    return Tensor.ones(*shape, dtype=value.dtype) * (value if shape != [0] else 1)
+    if shape == [0]: return Tensor([], dtype=value.dtype)
+    return value.expand(shape)
 
   def Size(data:Tensor): return data.numel()
   def Shape(data:Tensor, end:int|None=None, start:int=0): return Tensor(data.shape[start:end], dtype=dtypes.int64)
 
   # ***** Unary Ops (math) *****
   def Not(x:Tensor): return x.logical_not()
-  def Clip(x: Tensor, min:Tensor|None=None, max:Tensor|None=None):
-    return x.clip(float('-inf') if min is None else min, float('inf') if max is None else max).cast(x.dtype)
+  def Clip(x: Tensor, min:Tensor|None=None, max:Tensor|None=None): return x if min is None and max is None else x.clip(min, max)  # noqa: A002
+  def IsInf(x:Tensor, detect_negative:int=1, detect_positive:int=1): return x.isinf(bool(detect_positive), bool(detect_negative))
 
   # ***** Unary Ops (activation) *****
   def Softmax_1(x:Tensor, axis:int=1): return x.softmax(axis)
@@ -289,22 +330,17 @@ def get_onnx_ops():
   def HardSigmoid(x:Tensor, alpha:float=0.2, beta:float=0.5): return (alpha*x + beta).clip(0, 1)
   def Gelu(x:Tensor, approximate:str|None=None): return x.gelu() if approximate == "tanh" else 0.5 * x * (1 + (x/math.sqrt(2)).erf())
   def BiasGelu(x: Tensor, bias: Tensor, approximate: str | None = None) -> Tensor: return Gelu(x + bias, approximate)
-  def FastGelu(x:Tensor, bias:Tensor|None=None):
-    # this is tanh approximated
-    return (x + bias).gelu() if bias is not None else x.gelu()
-  # TODO: fix this
-  def PRelu(X:Tensor, slope:Tensor):
-    slope = slope[0] if slope.shape[-1] != X.shape[-1] else slope
-    return (X > 0).where(X, X * slope)
+  def FastGelu(x:Tensor, bias:Tensor|None=None): return (x + bias).gelu() if bias is not None else x.gelu() # this is tanh approximated
+  def PRelu(X:Tensor, slope:Tensor): return (X > 0).where(X, X * slope)
   def LeakyRelu(X:Tensor, alpha:float=0.01): return X.leaky_relu(alpha)
   def ThresholdedRelu(X:Tensor, alpha:float=1.0): return (X > alpha).where(X, 0)
   def LogSoftmax(x: Tensor, axis:int=-1): return x.log_softmax(axis)
   def Binarizer(x:Tensor, threshold:float=0.0): return (x > threshold).float()
 
   # ***** Unary Ops (broadcasted) *****
-  def Add(x:Tensor,y:Tensor, broadcast=None, axis=None): return x + y if x.dtype == dtypes.float or isinstance(x.dtype, ImageDType) else (x + y).cast(x.dtype)
+  def Add(x:Tensor,y:Tensor, broadcast=None, axis=None): return x + y
   def Sub(x:Tensor|int,y:Tensor): return x - y # some test has input as int
-  def Div(x:Tensor,y:Tensor): return (x/y).cast(x.dtype)
+  def Div(x:Tensor,y:Tensor): return x.div(y, rounding_mode='trunc' if dtypes.is_int(x.dtype) else None)
   def Less(x:Tensor,y:Tensor): return x < y
   def LessOrEqual(x:Tensor,y:Tensor): return x <= y
   def Greater(x:Tensor,y:Tensor): return x > y
@@ -323,7 +359,7 @@ def get_onnx_ops():
 
   # ***** Casting Ops *****
   # TODO: saturate
-  def Cast(x:Tensor, to:int, saturate:int=1): return x.cast(dtype_parse(to))
+  def Cast(x:Tensor, to:int, saturate:int=1): return x.cast(dtype_parse(to, "Cast op"))
   def CastLike(x:Tensor, target_type:Tensor, saturate:int=1): return x.cast(target_type.dtype)
 
   # ***** Reduce Ops *****
@@ -363,9 +399,8 @@ def get_onnx_ops():
   def Flatten(x:Tensor, axis:int=1): return x.reshape(prod(x.shape[0:axis]), -1)
   def Expand(x:Tensor, shape:list[int]): return x.expand(_broadcast_shape(x.shape, tuple(shape)))
   def Shrink(x:Tensor, bias:float=0.0, lambd:float=0.5): return (x < -lambd)*(x+bias) + (x > lambd)*(x-bias)
-  def Transpose(x:Tensor, perm:list[int]|None=None): return x.permute(order=list(range(x.ndim)[::-1]) if perm is None else perm)
+  def Transpose(x:Tensor, perm:list[int]|None=None): return x.permute(order=perm or list(range(x.ndim)[::-1]))
 
-  # TODO: add test for when axes is None
   def Squeeze(data:Tensor, axes:list[int]|None=None):
     return data.squeeze() if axes is None else functools.reduce(lambda d, dim: d.squeeze(dim), sorted(axes, reverse=True), data)
   def Unsqueeze(data:Tensor, axes:list[int]): return functools.reduce(lambda d, dim: d.unsqueeze(dim), sorted(axes), data)
@@ -409,11 +444,9 @@ def get_onnx_ops():
 
   def MaxPool(X: Tensor, kernel_shape:list[int], auto_pad:AUTO_PAD_OPTIONS="NOTSET", ceil_mode:int=0, dilations:list[int]|int=1, pads:list[int]|int=0,
               storage_order:int=0, strides:list[int]|int=1):
-    ret = X.max_pool2d(kernel_shape, strides, dilations, _resolve_pool_pads(X, pads, kernel_shape, dilations, strides, auto_pad), ceil_mode=ceil_mode)
-    # tests expect indices with int64 dtype
-    # TODO: if there are repeated values, this is wrong
-    indices = ((ret.reshape(-1, 1) == X.reshape(1, -1)) * Tensor.arange(X.numel(), dtype=dtypes.int64).unsqueeze(0)).sum(1).reshape(ret.shape)
-    return ret.cast(X.dtype), indices.transpose(-2, -1) if storage_order else indices
+    pads = _resolve_pool_pads(X, pads, kernel_shape, dilations, strides, auto_pad)
+    ret, idx = X.max_pool2d(kernel_shape, strides, dilations, pads, ceil_mode=ceil_mode, return_indices=True)
+    return ret, idx.transpose(-2, -1).cast(dtypes.int64) if storage_order else idx.cast(dtypes.int64)
 
   def Conv(X: Tensor, W: Tensor, B:Tensor|None=None, auto_pad:AUTO_PAD_OPTIONS="NOTSET", dilations:list[int]|int=1, group:int=1,
           kernel_shape:list[int]|None=None, pads:list[int]|int=0, strides:list[int]|int=1):
@@ -430,17 +463,13 @@ def get_onnx_ops():
                         zip(strides, input_shape, output_padding, kernel_shape, dilations, output_shape)], auto_pad)
     if pads is None: # we generate pads
       output_shape = output_shape or [X.shape[i+2] * strides[i] for i in range(len(strides))]
-      pads = [strides[i]*(input_shape[i]-1) + output_padding[i] + ((kernel_shape[i]-1)*dilations[i]+1)-output_shape[i] for i in range(len(input_shape))]
+      pads = [strides[i]*(input_shape[i]-1)+output_padding[i]+((kernel_shape[i]-1)*dilations[i]+1)-output_shape[i] for i in range(len(input_shape))]
       pads = _auto_pad(pads, auto_pad) if auto_pad != "NOTSET" else [0] * len(input_shape) * 2
     pads = _onnx_pads_to_tiny_pads(pads)
     return X.conv_transpose2d(W, B, stride=strides, groups=group, dilation=dilations, padding=pads, output_padding=output_padding)
 
   def MaxUnpool(xT: Tensor, xI: Tensor, outshape: list[int]|None=None, kernel_shape:list[int]=None, pads:list[int]|int=0, strides:list[int]|int=1):
-    pads, strides = (make_tuple(x, len(xI.shape)) for x in (pads, strides))
-    out_sh = [(ks//2)*2 + st * inps for inps, st, ks in zip(xI.shape, strides, kernel_shape)]
-    ret = (xI.reshape(-1, 1)._one_hot_along_dim(prod(out_sh)) * xT.reshape(-1, 1)).sum(0).reshape(1, 1, *out_sh)
-    if outshape is not None and outshape != ret.shape: pads = _auto_pad([outshape[-2] - ret.shape[-2], outshape[-1] - ret.shape[-1]], "SAME_UPPER")
-    return ret.pad(_onnx_pads_to_tiny_pads(pads))
+    return Tensor.max_unpool2d(xT, xI, kernel_shape, strides, 1, pads, outshape if outshape is None else tuple(outshape))
 
   def GlobalAveragePool(X:Tensor): return X.mean(axis=tuple(range(2, X.ndim)), keepdim=True)
   def GlobalMaxPool(X:Tensor): return X.max(axis=tuple(range(2, X.ndim)), keepdim=True)
@@ -470,7 +499,7 @@ def get_onnx_ops():
       elif mode in ["floor", "ceil"]: index = getattr(index, mode)()
       else: raise ValueError(f"invalid {nearest_mode=}")
       return index.cast(dtypes.int32).clip(0, input_dim-1)
-    def _apply_transformation(index: Tensor, input_dim, scale_dim, roi_dim, mode):
+    def _apply_transformation(index: Tensor, input_dim, scale_dim, mode):
       # TODO: needs more testing, not confident in this
       # NOTE: their reference implementation differ from the implementation in their reference docs
       # https://github.com/onnx/onnx/blob/main/onnx/reference/ops/op_resize.py
@@ -481,8 +510,7 @@ def get_onnx_ops():
       elif mode == "asymmetric": index = index / scale_dim
       elif mode == "pytorch_half_pixel": index = (index + 0.5) / scale_dim - 0.5 if output_dim != 1 else Tensor([-0.5])
       elif mode == "half_pixel_symmetric": index = input_dim / 2 * (1 - int(output_dim) / output_dim) + (index + 0.5) / scale_dim - 0.5
-      elif mode == "tf_crop_and_resize": index = roi_dim[0] * (input_dim - 1) + index * ((roi_dim[1] - roi_dim[0]) * (input_dim - 1) / (output_dim - 1))
-      else: raise ValueError(f"invalid {coordinate_transformation_mode=}")
+      else: raise NotImplementedError(f"invalid {coordinate_transformation_mode=}")
       return index.clip(0, input_dim-1)
 
     scales, sizes = (None if scales is None else scales[2-(X.ndim-len(scales)):]), (None if sizes is None else sizes[2-(X.ndim-len(sizes)):])
@@ -500,13 +528,12 @@ def get_onnx_ops():
         scales = [size / input_shape for size, input_shape in zip(sizes, input_shape)]
     else:
       sizes = [int(sc*sh) for sc, sh in zip(scales, input_shape)]
-    regions = [[st, ed] for st, ed in zip(roi, roi[len(roi)//2:])] if isinstance(roi, list) and roi else [[0.0, 0.0]] * (X.ndim-2)
 
     # NOTE: this transformation makes it so that we can't just call Tensor.interpolate
     # in Tensor.interpolate, we use indexes without any transformation
     indexes = []
-    for shape, size, scale, region in zip(input_shape, sizes, scales, regions):
-      indexes.append(_apply_transformation(Tensor.arange(size), shape, scale, region, coordinate_transformation_mode))
+    for shape, size, scale in zip(input_shape, sizes, scales):
+      indexes.append(_apply_transformation(Tensor.arange(size), shape, scale, coordinate_transformation_mode))
 
     if mode == "nearest":
       indexes = [_apply_nearest_mode(index, shape, nearest_mode) for (index, shape) in zip(indexes, input_shape)]
@@ -519,8 +546,12 @@ def get_onnx_ops():
         low, high, perc = [y.reshape(reshape).expand(expand) for y in (index.floor().int(), index.ceil().int(), index - index.floor())]
         X = X.gather(i, low).lerp(X.gather(i, high), perc)
     if mode == "cubic": raise NotImplementedError("cubic interpolation is not implemented")
-    return X.permute(*[perm.index(i) for i in range(len(perm))]) if perm else X
+    return X.permute(*argsort(perm)) if perm else X
   def Upsample(X, scales, mode): return Resize(X=X, scales=scales, mode=mode)  # deprecated
+
+  def TopK(X:Tensor, K:int|list[int], axis:int=-1, largest:int=1, sorted:int=1):  # noqa: A002
+    val, idx = X.topk(K if isinstance(K, int) else K[0], axis, largest, sorted)
+    return val, idx.cast(dtypes.int64)
 
   # ***** Neural Network Ops *****
   def BatchNormalization(X:Tensor, scale:Tensor, B:Tensor, input_mean:Tensor, input_var:Tensor, epsilon:float=1e-05, momentum:float=0.9,
@@ -536,20 +567,17 @@ def get_onnx_ops():
       running_var = input_var * momentum + current_var * (1 - momentum)
 
       return X.batchnorm(scale, B, current_mean, current_invstd), running_mean, running_var
-    invstd = (input_var + epsilon).rsqrt()
-    return X.batchnorm(scale, B, input_mean, invstd)
-  def InstanceNormalization(x:Tensor, scale:Tensor, bias:Tensor, epsilon:float=1e-05):
-    x = x.reshape(x.shape[0], x.shape[1], -1).layernorm(eps=epsilon).reshape(x.shape)
+    return X.batchnorm(scale, B, input_mean, (input_var + epsilon).rsqrt())
+  def GroupNormalization(x:Tensor, scale:Tensor, bias:Tensor, num_groups:int, epsilon:float=1e-05):
+    x = x.reshape(x.shape[0], num_groups, -1).layernorm(eps=epsilon).reshape(x.shape)
     return x * scale.reshape(1, -1, *[1] * (x.ndim-2)) + bias.reshape(1, -1, *[1] * (x.ndim-2))
+  def InstanceNormalization(x:Tensor, scale:Tensor, bias:Tensor, epsilon:float=1e-05):
+    return GroupNormalization(x, scale, bias, num_groups=x.shape[1], epsilon=epsilon)
   def LayerNormalization(x:Tensor, scale:Tensor, bias:Tensor, axis:int=-1, epsilon:float=1e-05, stash_type:int=1):
     assert stash_type == 1, "only float32 is supported"
     axes = tuple(i for i in range(axis if axis >= 0 else x.ndim + axis, x.ndim))
     mean = x.mean(axis=axes, keepdim=True)
     return x.layernorm(axes, epsilon).mul(scale).add(bias), mean, (x.sub(mean)).square().mean(axis=axes, keepdim=True).add(epsilon).rsqrt()
-  def GroupNormalization(x:Tensor, scale:Tensor, bias:Tensor, num_groups:int, epsilon:float=1e-05):
-    return x.reshape(x.shape[0], num_groups, -1).layernorm(axis=-1, eps=epsilon).mul(scale.unsqueeze(-1)).add(bias.unsqueeze(-1)).reshape(x.shape)
-  def MeanVarianceNormalization(x:Tensor, axis:list[int]=[0,2,3]):
-    return (x - x.mean(axis, keepdim=True)) / (x.std(axis, keepdim=True, correction=0) + 1e-9)
   def SkipLayerNormalization(x:Tensor, skip:Tensor, gamma:Tensor, beta:Tensor|None=None, bias:Tensor|None=None, epsilon:float=1e-12):
     x = x + skip
     if bias is not None: x = x + bias
@@ -581,6 +609,8 @@ def get_onnx_ops():
     if seg_embedding_res is not None: embedding_sum = embedding_sum + seg_embedding_res
     out = embedding_sum.layernorm(eps=epsilon) * gamma + beta
     return out, None, embedding_sum
+  def MeanVarianceNormalization(x:Tensor, axis:list[int]=[0,2,3]):
+    return (x - x.mean(axis, keepdim=True)) / (x.std(axis, keepdim=True, correction=0) + 1e-9)
 
   def OneHot(indices:Tensor, depth:float|int|list, values:Tensor, axis:int=-1):
     # Scalar or Rank 1 tensor containing exactly one element
@@ -596,9 +626,13 @@ def get_onnx_ops():
 
   # Reimplemented here because you need legacy RNG for passing ONNX tests.
   def Dropout_7(data:Tensor, ratio:float=0.5, training_mode:bool=False, seed:int|None=None):
-    if not training_mode: return data, Tensor.ones(data.shape, dtype=dtypes.bool)  # if mask is requested as output it will contain all True's.
-    mask = Tensor(np.random.RandomState(seed).random(cast(tuple[int,...], data.shape)) >= ratio, requires_grad=False, device=data.device)
-    return data * mask * (1/(1.0 - ratio)), mask
+    if not training_mode: return data, data.full_like(True, dtype=dtypes.bool)
+    if seed is not None:
+      rand = Tensor(np.random.RandomState(seed).random(cast(tuple[int,...], data.shape)), requires_grad=False, dtype=data.dtype, device=data.device)
+    else:
+      rand = data.rand_like(requires_grad=False)
+    mask = rand >= ratio
+    return data * mask / (1.0 - ratio), mask
   # 6 with 'is_test' needed for https://github.com/MTlab/onnx2caffe/raw/refs/heads/master/model/MobileNetV2.onnx
   def Dropout_6(data:Tensor, ratio:float=0.5, is_test=0): return Dropout_7(data, ratio, training_mode=not is_test)
   Dropout = {6:Dropout_6, 7:Dropout_7}
@@ -616,7 +650,8 @@ def get_onnx_ops():
   def AffineGrid(theta:Tensor, size:list[int], align_corners:int=0):
     N, _, *spatial_dims = size
     def generate_grid(steps):
-      return Tensor.linspace(-1, 1, steps, device=theta.device) if align_corners else Tensor.linspace(-1+1/steps, 1-1/steps, steps, device=theta.device)
+      if align_corners: return Tensor.linspace(-1, 1, steps, device=theta.device)
+      return Tensor.linspace(-1+1/steps, 1-1/steps, steps, device=theta.device)
     grids = Tensor.meshgrid(*(generate_grid(d) for d in spatial_dims))
     base_grid = Tensor.stack(*reversed(grids), Tensor.ones_like(grids[0], device=theta.device), dim=-1)
     base_grid = base_grid.reshape(1, prod(spatial_dims), len(grids)+1).expand(N, -1, -1)
@@ -717,14 +752,21 @@ def get_onnx_ops():
       inp = inp.flatten()
       axis = 0
     if axis < 0: axis += inp.ndim
-    con = Tensor(np.arange(len(condition))[condition]) # no boolean indexing in Tensor
+    con = Tensor([i for i,cond in enumerate(condition) if cond]) # compress in python
     return inp[tuple(con if i == axis else slice(None) for i in range(inp.ndim))]
 
   # ***** Quantization Ops *****
   def QuantizeLinear(x:Tensor, y_scale:Tensor, y_zero_point:Tensor|int=0, axis:int=1, block_size:int=0, output_dtype:int=0, saturate=1):
-    out_dtype = y_zero_point.dtype if isinstance(y_zero_point, Tensor) else dtype_parse(output_dtype) if output_dtype else dtypes.uint8
+    if isinstance(y_zero_point, Tensor): out_dtype = y_zero_point.dtype
+    elif output_dtype != 0: out_dtype = dtype_parse(output_dtype, "QuantizeLinear op")
+    else: out_dtype = dtypes.uint8
     y_scale, y_zero_point = _prepare_quantize(x, y_scale, y_zero_point, axis, block_size)
-    return _clamp_cast(((x / y_scale).round() + y_zero_point), out_dtype).contiguous()
+    if out_dtype == dtypes.uchar:
+      # this appears to work in practice, at least for uchar out_dtype. it folds with the quantize stuff
+      ret = _clamp_cast((x / y_scale + 0.4999999 + y_zero_point).int(), out_dtype)
+    else:
+      ret = _clamp_cast(((x / y_scale).round() + y_zero_point), out_dtype)
+    return ret.contiguous()
 
   def DynamicQuantizeLinear(x: Tensor):
     # only support uint8
@@ -753,7 +795,7 @@ def get_onnx_ops():
     return _qlinearop_quantized(Tensor.mul, [a,b], [a_zero_point,b_zero_point], [a_scale,b_scale], c_scale, c_zero_point)
 
   def QLinearGlobalAveragePool(X:Tensor, x_scale:Tensor, x_zero_point:Tensor, y_scale:Tensor, y_zero_point:Tensor, channels_last:int):
-    assert channels_last == 0, "unsure what this does"
+    assert channels_last == 0, "TODO NHWC"
     return _qlinearop_float(GlobalAveragePool, [X], [x_zero_point], [x_scale], y_scale, y_zero_point)
 
   def ConvInteger(x: Tensor, w: Tensor, x_zero_point: Tensor | int = 0, w_zero_point: Tensor | int = 0, B: Tensor | None = None, **opts) -> Tensor:
@@ -763,7 +805,6 @@ def get_onnx_ops():
     return _op_integer(Tensor.matmul, [A,B], [a_zero_point,b_zero_point])
 
   # ***** Training Ops *****
-  # NOTE: onnx test coverage only covers `T==0` cases, so for all `T>0` this isn't tested
   # NOTE: onnx training ops actually don't need the state for optim, all the ops work in a functional way, but we still can reuse optim.py code
   @_onnx_training(3)
   def Adagrad(R:Tensor, T:int, *inputs:Tensor, decay_factor:float=0.0, epsilon:float=0.0, norm_coefficient:float=0.0):
@@ -780,7 +821,7 @@ def get_onnx_ops():
           norm_coefficient_post:float=0.0):
     from tinygrad.nn.optim import Adam as TinyAdam
     X, G, V, H = inputs
-    G, V, H = G.detach(), V.detach(), H.detach()  # TODO we shouldn't need these detaches
+    G, V, H = G.detach(), V.detach(), H.detach()
     X.grad = norm_coefficient * X.detach() + G
     opt = TinyAdam([X], b1=alpha, b2=beta, eps=epsilon)
     opt.m, opt.v, opt.lr = [V], [H], R
@@ -796,13 +837,12 @@ def get_onnx_ops():
 
   @_onnx_training(3)
   def Momentum(R:Tensor, T:int, *inputs:Tensor, alpha:float, beta:float, mode:str, norm_coefficient:float):
-    from tinygrad.nn.optim import SGD
-    X, G, V = inputs
-    G, V = G.detach(), V.detach()
-    X.grad = (norm_coefficient * X.detach() + G) * (beta if T > 0 else 1)
-    opt = SGD([X], momentum=alpha, nesterov=(mode=="nesterov"))
-    opt.b, opt.lr = [V], R
-    opt.step()
+    X, G, V = (i.detach() for i in inputs)
+    grad = norm_coefficient * X + G
+    # NOTE: this beta_adjusted term makes it so we can't use SGD for nesterov
+    beta_adjusted = beta if T > 0 else 1
+    V.assign(alpha * V + grad * beta_adjusted)
+    X.assign(X - R * (V if mode == "standard" else (grad + alpha * V)))
     return [X, V]
 
   def Gradient(*inputs:Tensor, y:str, intermediate_tensors:dict[str, Tensor], **_):
@@ -812,7 +852,7 @@ def get_onnx_ops():
   return {
     # Tensor ops
     **{op: getattr(Tensor, op.lower()) for op in ("Neg", "Reciprocal", "Pow", "Sqrt", "Sign", "Abs", "Exp", "Log", "Mish", "Sin", "Cos", "Tan",
-    "Asin", "Acos", "Atan", "Relu", "Sigmoid", "MatMul", "Floor", "Ceil", "IsInf", "IsNaN", "Softplus", "HardSwish", "Where", "Mul", "Sinh", "Cosh",
+    "Asin", "Acos", "Atan", "Relu", "Sigmoid", "MatMul", "Floor", "Ceil", "IsNaN", "Softplus", "HardSwish", "Where", "Mul", "Sinh", "Cosh",
     "Tanh", "Softsign", "Asinh", "Acosh", "Atanh",  "Elu", "Celu", "Selu", "Round", "Erf")},
     # Implemented ops
     **{name:obj for name,obj in locals().items() if isinstance(obj, types.FunctionType) and not name.startswith("_") and name[0].isupper()},
